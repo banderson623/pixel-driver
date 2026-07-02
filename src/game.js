@@ -288,9 +288,40 @@ export class Game {
     ctx.fillStyle = sp < 0.5 ? '#39d353' : sp < 0.8 ? '#e8c33a' : '#e05545';
     ctx.fillRect(10, H - 14, Math.round(78 * sp), 5);
 
+    // steering wheel gauge (shows driver input; tints as the car slides)
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(96, H - 34, 40, 28);
+    drawText(ctx, 'STEER', 100, H - 31, 1, '#9a9aa4');
+    this.drawSteeringWheel(ctx, 116, H - 16, 9, this.player.steerS, this.player.skidLevel);
+
     // seed + odometer
     const info = `SEED ${this.seedStr}  ${s.dist.toFixed(2)} MI`;
     drawText(ctx, info, W - textWidth(info, 1) - 6, 9, 1, 'rgba(255,255,255,0.55)');
+  }
+
+  // Top-down steering wheel that rotates with steerS. A fixed notch marks
+  // 12 o'clock so you can read the wheel's offset from straight-ahead.
+  drawSteeringWheel(ctx, cx, cy, r, steer, skid) {
+    const t = Math.min(1, skid);
+    const col = t < 0.45 ? '#ffffff' : t < 0.8 ? '#e8c33a' : '#e05545';
+    // fixed reference notch (does not rotate)
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(cx - 1, cy - r - 3, 2, 3);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(steer * 2.4); // full lock ~ +/-137 degrees
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-r, 0); ctx.lineTo(r, 0); // horizontal spokes
+    ctx.moveTo(0, 0); ctx.lineTo(0, r);  // lower spoke
+    ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.fillRect(-2, -2, 4, 4);           // hub
+    ctx.restore();
   }
 
   renderMenu(ctx) {

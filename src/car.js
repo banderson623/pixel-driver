@@ -174,6 +174,8 @@ const KINETIC = 0.5;     // grip fraction left once a tire lets go
 const HB_REAR = 0.14;    // rear grip fraction under handbrake
 const THROTTLE_DRAIN = 0.5; // how much full throttle eats rear grip
 const STEER_MAX = 0.55;  // max wheel angle (rad), fades with speed
+const STEER_RATE = 7;        // base wheel-swing speed (1/s) when gripping
+const STEER_RATE_DRIFT = 13; // extra swing speed added at full slide (catch counter-steer)
 const OMEGA_DAMP = 0.9;  // yaw damping (spin-out protection)
 const OMEGA_MAX = 3.2;
 
@@ -215,9 +217,10 @@ export class PlayerCar {
       if (input.down('ArrowRight', 'KeyD')) steer += 1;
       hand = input.down('Space');
     }
-    // steering response
+    // steering response: the wheel swings faster the harder you're sliding,
+    // so counter-steer snaps over quickly enough to catch a drift
     const target = steer;
-    const rate = 7;
+    const rate = STEER_RATE + this.skidLevel * STEER_RATE_DRIFT; // ~7 gripping, ~20 in a full slide
     this.steerS += (target - this.steerS) * Math.min(1, rate * dt);
 
     this.step(dt / 2, throttle, brake, hand, env);
@@ -270,8 +273,11 @@ export class PlayerCar {
     this.vx = fwd[0] * vf + right[0] * vl0;
     this.vy = fwd[1] * vf + right[1] * vl0;
 
-    // --- steering: wheel angle shrinks with speed (turn-radius feel) ---
-    const delta = this.steerS * STEER_MAX / (1 + Math.abs(vf) / 170);
+    // --- steering: wheel angle shrinks with speed for high-speed stability,
+    // but a slide restores most of that lock so you keep the authority to
+    // counter-steer and hold the drift ---
+    const speedAtten = 1 + (Math.abs(vf) / 170) * (1 - 0.75 * this.skidLevel);
+    const delta = this.steerS * STEER_MAX / speedAtten;
 
     // --- axle grip limits (traction circle: throttle drains the rear) ---
     const gscale = 1 / Math.sqrt(surf); // grass/dirt slide much sooner
