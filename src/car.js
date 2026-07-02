@@ -156,10 +156,26 @@ const ACCEL = 195;
 const BRAKE = 340;
 const REV_MAX = 80;
 const DRAG = 0.34;
-const TURN = 3.0;
-const GRIP = 7.4;
-const GRIP_HB = 1.7;
-const OVERSTEER = 68;
+
+// Two-axle drift model. Each axle tries to cancel its lateral velocity
+// (a damper, gain K_LAT) but the correcting force is capped by that axle's
+// grip. Past the cap the tire slides and only KINETIC of the limit remains
+// — that static->kinetic drop is what makes slides progressive and easy to
+// hold. Throttle drains rear grip (traction circle -> power slides) and the
+// handbrake all but removes it. Yaw is integrated for real: rear breakaway
+// rotates the car into the drift, and finite front grip lets counter-steer
+// catch it.
+const AXLE = 8;          // half wheelbase (px)
+const INERTIA = 48;
+const K_LAT = 16;        // lateral damping gain (1/s); higher = snappier grip
+const GRIP_F = 250;      // front axle grip limit (px/s^2)
+const GRIP_R = 295;      // rear axle grip limit
+const KINETIC = 0.5;     // grip fraction left once a tire lets go
+const HB_REAR = 0.14;    // rear grip fraction under handbrake
+const THROTTLE_DRAIN = 0.5; // how much full throttle eats rear grip
+const STEER_MAX = 0.55;  // max wheel angle (rad), fades with speed
+const OMEGA_DAMP = 0.9;  // yaw damping (spin-out protection)
+const OMEGA_MAX = 3.2;
 
 export class PlayerCar {
   constructor(x, y, heading) {
@@ -236,46 +252,81 @@ export class PlayerCar {
   step(dt, throttle, brake, hand, env) {
     const fwd = this.forward(), right = this.rightVec();
     let vf = this.vx * fwd[0] + this.vy * fwd[1];
-    let vl = this.vx * right[0] + this.vy * right[1];
+    const vl0 = this.vx * right[0] + this.vy * right[1];
 
-    // engine / brakes
-    if (throttle) vf += ACCEL * (1 - 0.55 * Math.max(0, vf) / VMAX) * dt;
+    // --- longitudinal: engine, brakes, drag (forward component only) ---
+    const surf = env.world.surfaceDrag(this.x, this.y);
+    let driveFrac = 0;
+    if (throttle) {
+      vf += ACCEL * (1 - 0.55 * Math.max(0, vf) / VMAX) * dt;
+      driveFrac = 1;
+    }
     if (brake) {
       if (vf > 5) vf -= BRAKE * dt;
       else vf = Math.max(-REV_MAX, vf - ACCEL * 0.55 * dt);
     }
-    const surf = env.world.surfaceDrag(this.x, this.y);
     vf -= vf * DRAG * surf * dt;
+    if (hand) vf *= Math.exp(-0.6 * dt); // locked rears scrub speed
+    this.vx = fwd[0] * vf + right[0] * vl0;
+    this.vy = fwd[1] * vf + right[1] * vl0;
 
-    // steering (reverses when backing up)
-    const sf = Math.min(Math.abs(vf) / 70, 1) * (1 - 0.30 * Math.min(Math.abs(vf) / VMAX, 1));
-    const dir = vf >= 0 ? 1 : -1;
-    this.heading += this.steerS * TURN * sf * dir * dt + this.spin * dt;
-    this.spin *= Math.exp(-3.5 * dt);
+    // --- steering: wheel angle shrinks with speed (turn-radius feel) ---
+    const delta = this.steerS * STEER_MAX / (1 + Math.abs(vf) / 170);
 
-    // oversteer: fast cornering kicks the tail out
-    if (Math.abs(this.steerS) > 0.25 && Math.abs(vf) > 85) {
-      vl += this.steerS * OVERSTEER * dt * Math.min(vf / 150, 1.5);
-    }
-    // lateral grip (handbrake almost removes it)
-    let grip = hand ? GRIP_HB : GRIP;
-    if (Math.abs(vl) > 55) grip *= 0.72; // once sliding, keep sliding
-    vl *= Math.exp(-grip * dt);
-    if (hand) vf *= Math.exp(-0.45 * dt);
+    // --- axle grip limits (traction circle: throttle drains the rear) ---
+    const gscale = 1 / Math.sqrt(surf); // grass/dirt slide much sooner
+    const frontLimit = GRIP_F * gscale;
+    const rearLimit = GRIP_R * gscale *
+      (1 - THROTTLE_DRAIN * driveFrac * Math.min(1, Math.abs(vf) / 60 + 0.4)) *
+      (hand ? HB_REAR : 1);
 
-    this.skidLevel = Math.min(1, Math.max(
-      (Math.abs(vl) - 22) / 60,
-      hand && Math.abs(vf) > 55 ? 0.5 : 0
-    ));
+    const frontSlide = this.axle(1, delta, frontLimit, dt);
+    const rearSlide = this.axle(-1, 0, rearLimit, dt);
 
-    const nf = this.forward(), nr = this.rightVec();
-    this.vx = nf[0] * vf + nr[0] * vl;
-    this.vy = nf[1] * vf + nr[1] * vl;
+    // yaw damping + cap: the "don't spin out" guards
+    this.spin *= Math.exp(-OMEGA_DAMP * dt);
+    if (this.spin > OMEGA_MAX) this.spin = OMEGA_MAX;
+    else if (this.spin < -OMEGA_MAX) this.spin = -OMEGA_MAX;
+    this.heading += this.spin * dt;
+
+    // skid intensity drives smoke, marks and sound (rear-biased)
+    let target = 0;
+    if (rearSlide > 1) target = Math.min(1, (rearSlide - 1) * 0.8 + 0.3);
+    if (frontSlide > 1) target = Math.max(target, 0.3);
+    if (hand && Math.abs(vf) > 50) target = Math.max(target, 0.5);
+    this.skidLevel += (target - this.skidLevel) * Math.min(1, 14 * dt);
+
     this.x += this.vx * dt;
     this.y += this.vy * dt;
 
     this.collideWorld(env);
     this.collideProps(env);
+  }
+
+  // One tire pass: a damper that cancels the axle's lateral velocity,
+  // capped by grip. Past the cap the tire slides and keeps only KINETIC of
+  // the limit. Applies force to velocity AND torque to spin, so rear
+  // breakaway rotates the car into a drift and the front catches it.
+  // Returns demand/limit — above 1 means this axle is sliding.
+  axle(sign, delta, limit, dt) {
+    const fwd = this.forward(), right = this.rightVec();
+    const rx = fwd[0] * AXLE * sign, ry = fwd[1] * AXLE * sign;
+    // this axle's ground velocity = body velocity + spin x r
+    const avx = this.vx - this.spin * ry;
+    const avy = this.vy + this.spin * rx;
+    // wheel sideways direction (front axle rotated by steering angle)
+    const cs = Math.cos(delta), sn = Math.sin(delta);
+    const wrx = right[0] * cs - right[1] * sn;
+    const wry = right[0] * sn + right[1] * cs;
+    const lat = avx * wrx + avy * wry;
+    const demand = K_LAT * lat;
+    const excess = Math.abs(demand) / limit;
+    const a = excess > 1 ? Math.sign(demand) * limit * KINETIC : demand;
+    // half the mass rides on each axle
+    this.vx -= wrx * a * dt * 0.5;
+    this.vy -= wry * a * dt * 0.5;
+    this.spin += (rx * wry - ry * wrx) * -0.5 * a / INERTIA * dt;
+    return excess;
   }
 
   collideWorld(env) {
