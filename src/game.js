@@ -62,8 +62,14 @@ export class Game {
     window.addEventListener('pointerdown', () => this.sound.ensure());
   }
 
+  // Dev test pad: these seeds generate open pavement with no obstacles.
+  isFlatSeed() {
+    const s = this.seedStr.toUpperCase();
+    return s === 'TESTPAD' || s === 'FLAT' || s === 'DEV';
+  }
+
   buildMenuWorld() {
-    this.world = new World(hashStr(this.seedStr));
+    this.world = new World(hashStr(this.seedStr), this.isFlatSeed());
     this.camera = new Camera();
     const vx = this.world.vA.center(0);
     this.camera.x = vx; this.camera.y = 60;
@@ -71,7 +77,7 @@ export class Game {
 
   startRun() {
     const seed = hashStr(this.seedStr);
-    this.world = new World(seed);
+    this.world = new World(seed, this.isFlatSeed());
     this.particles = new Particles();
     this.traffic = new Traffic(this.world);
     this.camera = new Camera();

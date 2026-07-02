@@ -318,7 +318,7 @@ export class Traffic {
     env.obstacles = this.cars.concat([player]);
 
     this.spawnT -= dt;
-    if (this.spawnT <= 0) {
+    if (!this.world.flat && this.spawnT <= 0) {
       this.spawnT = 0.4;
       this.syncParked(player);
       const driving = this.cars.filter(c => !c.parkedOrigin && c.mode !== 'wreck').length;

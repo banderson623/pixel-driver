@@ -211,8 +211,9 @@ class Chunk {
 
 // ------------------------------------------------------------------- world
 export class World {
-  constructor(seed) {
+  constructor(seed, flat = false) {
     this.seed = seed | 0;
+    this.flat = flat; // dev test pad: open pavement, no buildings/props/traffic
     this.vA = new Axis(this.seed, 1);
     this.hA = new Axis(this.seed, 2);
     this.chunks = new Map();
@@ -346,6 +347,14 @@ export class World {
 
   // ---- pixel classification (used during chunk generation)
   classify(wx, wy) {
+    if (this.flat) {
+      // dashed reference grid every 64px so speed & drift angle are legible
+      // (cells sample at odd world coords, so match a 2px-wide band)
+      const gx = ((wx % 64) + 64) % 64, gy = ((wy % 64) + 64) % 64;
+      if (gx < 2 && (Math.floor(wy / 8) & 1) === 0) return T.LANEY;
+      if (gy < 2 && (Math.floor(wx / 8) & 1) === 0) return T.LANEY;
+      return this.noise(wx, wy) < 0.12 ? T.ASPH2 : T.ASPH;
+    }
     const nv = this.vA.nearest(wx), nh = this.hA.nearest(wy);
     const dxv = wx - nv.c, dyh = wy - nh.c;
     const adx = Math.abs(dxv), ady = Math.abs(dyh);
@@ -410,6 +419,7 @@ export class World {
 
   // ---- props & parked-car spawns for a chunk
   populate(ch) {
+    if (this.flat) return; // test pad: no props or parked cars
     const x0 = ch.x0, y0 = ch.y0, x1 = x0 + CHUNK, y1 = y0 + CHUNK;
     const inCh = (x, y) => x >= x0 && x < x1 && y >= y0 && y < y1;
     const mkProp = (t, x, y, extra) => {
