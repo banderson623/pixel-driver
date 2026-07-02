@@ -174,10 +174,13 @@ const KINETIC = 0.5;     // grip fraction left once a tire lets go
 const HB_REAR = 0.14;    // rear grip fraction under handbrake
 const THROTTLE_DRAIN = 0.5; // how much full throttle eats rear grip
 const STEER_MAX = 0.55;  // max wheel angle (rad), fades with speed
-const STEER_RATE = 7;        // base wheel-swing speed (1/s) when gripping
+const STEER_RATE = 10;        // base wheel-swing speed (1/s) when gripping
 const STEER_RATE_DRIFT = 13; // extra swing speed added at full slide (catch counter-steer)
 const OMEGA_DAMP = 0.9;  // yaw damping (spin-out protection)
 const OMEGA_MAX = 3.2;
+// Speed kept when plowing through a prop. Props are soft (see PROP_SOFTNESS in
+// world.js): 10% of the former 8% scrub, so smashing one barely slows you.
+const PROP_SMASH_KEEP = 1 - 0.08 * 0.1; // = 0.992
 
 export class PlayerCar {
   constructor(x, y, heading) {
@@ -421,7 +424,7 @@ export class PlayerCar {
           this.addDamage(p.dmg, env);
           env.stats.propsSmashed++;
           env.camera.addTrauma(0.12 + p.dmg * 0.03);
-          this.vx *= 0.92; this.vy *= 0.92;
+          this.vx *= PROP_SMASH_KEEP; this.vy *= PROP_SMASH_KEEP;
           if (p.dmg >= 4) this.deformAtWorld(p.x, p.y, 0.35, env);
         } else {
           // solid bollard: bounce off

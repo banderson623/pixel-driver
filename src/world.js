@@ -129,6 +129,16 @@ const PROP_DEFS = {
   tree1:   { r: 2.5, breakAt: 100, dmg: 4, sturdy: true },
 };
 
+// Props (everything that isn't a building or a car) hit soft: they deal only
+// a fraction of their base damage and resist only a fraction of the momentum
+// before yielding, so you plow through street furniture instead of being
+// stopped by it. breakAt = stopping ability, dmg = damage dealt.
+export const PROP_SOFTNESS = 0.1;
+for (const k in PROP_DEFS) {
+  PROP_DEFS[k].dmg *= PROP_SOFTNESS;
+  PROP_DEFS[k].breakAt *= PROP_SOFTNESS;
+}
+
 const PROP_DEBRIS = {
   light: ['#26262c', '#39d353', '#e05545'],
   sign: ['#a02828', '#e8e8e8', '#555'],
@@ -199,6 +209,7 @@ class Chunk {
       }
     }
     this.ctx.putImageData(img, 0, 0);
+    world.paintShadows(this);
     world.populate(this);
   }
 
@@ -280,7 +291,8 @@ export class World {
           const bx0 = lx0 + in0, by0 = ly0 + in1;
           const bx1 = Math.max(bx0 + 20, lx0 + lw - in2), by1 = Math.max(by0 + 20, ly0 + lh - in3);
           const s = Math.floor(R() * SCHEMES.length);
-          L.rects.push({ x0: bx0, y0: by0, x1: bx1, y1: by1, kind: 'b', s });
+          const bh = 1 + Math.floor(R() * 4); // height tier 1..4 -> shadow length
+          L.rects.push({ x0: bx0, y0: by0, x1: bx1, y1: by1, kind: 'b', s, h: bh });
           const m = 1 + Math.floor(R() * 3);
           for (let d = 0; d < m; d++) {
             const dw = 5 + R() * 6, dh = 5 + R() * 6;
@@ -414,6 +426,46 @@ export class World {
       case 'lot': return nz < 0.12 ? T.ASPH2 : T.ASPH;
       case 'plaza': return nz < 0.25 ? T.PLAZA2 : T.PLAZA;
       default: return nz < 0.2 ? T.ALLEY2 : T.ALLEY;
+    }
+  }
+
+  // Bake building drop-shadows onto the chunk canvas. Light comes from the
+  // top-left, so each building casts a solid shadow lip down-right whose length
+  // scales with its height tier — tall towers throw long shadows, ground-level
+  // parks and roads throw none. That contrast is what makes height read at a
+  // glance. Buildings are repainted afterward so the shadow only lands on the
+  // ground around them, not on the roofs.
+  paintShadows(ch) {
+    if (this.flat) return;
+    const g = ch.ctx, x0 = ch.x0, y0 = ch.y0;
+    const M = 16; // reach up-light of the chunk for buildings that cast into it
+    const iA = this.vA.locate(x0 - M), iB = this.vA.locate(x0 + CHUNK);
+    const jA = this.hA.locate(y0 - M), jB = this.hA.locate(y0 + CHUNK);
+    g.save();
+    g.beginPath();
+    g.rect(0, 0, CHUNK, CHUNK);
+    g.clip();
+    g.fillStyle = 'rgba(8,8,14,0.34)';
+    for (let i = iA; i <= iB; i++) {
+      for (let j = jA; j <= jB; j++) {
+        const L = this.block(i, j);
+        for (const r of L.rects) {
+          if (r.kind !== 'b') continue;
+          const off = 4 + (r.h || 1) * 2; // height tier -> shadow lip length (px)
+          g.fillRect(r.x0 - x0, r.y0 - y0, (r.x1 - r.x0) + off, (r.y1 - r.y0) + off);
+        }
+      }
+    }
+    g.restore();
+    // repaint building cells so the shadow only shows on the ground
+    for (let cj = 0; cj < CPC; cj++) {
+      for (let ci = 0; ci < CPC; ci++) {
+        const idx = ch.cells[cj * CPC + ci];
+        if (isSolidIdx(idx)) {
+          g.fillStyle = PAL[idx];
+          g.fillRect(ci * CELL, cj * CELL, CELL, CELL);
+        }
+      }
     }
   }
 
