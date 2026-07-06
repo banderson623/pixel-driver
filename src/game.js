@@ -2,7 +2,7 @@
 // HUD (damage meter + speedometer), and the per-frame update/render loop.
 
 import { World } from './world.js';
-import { PlayerCar, CarBody } from './car.js';
+import { PlayerCar, CarBody, VEHICLES, VEHICLE_KEYS } from './car.js';
 import { Traffic } from './traffic.js';
 import { Particles } from './particles.js';
 import { Input } from './input.js';
@@ -55,7 +55,10 @@ export class Game {
     this.menuT = 0;
     this.fps = 60;
     this.muteFlash = 0;
-    this.menuCar = new CarBody('#c23b3b', '#e8e8e8');
+    // selected vehicle (remembered between sessions)
+    this.vehicleKey = VEHICLE_KEYS.includes(localStorage.getItem('pixeldriver.vehicle'))
+      ? localStorage.getItem('pixeldriver.vehicle') : 'car';
+    this.buildMenuCar();
     this.buildMenuWorld();
 
     window.addEventListener('keydown', () => this.sound.ensure(), { once: false });
@@ -66,6 +69,18 @@ export class Game {
   isFlatSeed() {
     const s = this.seedStr.toUpperCase();
     return s === 'TESTPAD' || s === 'FLAT' || s === 'DEV';
+  }
+
+  buildMenuCar() {
+    const v = VEHICLES[this.vehicleKey];
+    this.menuCar = new CarBody(v.base, v.stripe, v.design);
+  }
+
+  switchVehicle(dir) {
+    const i = VEHICLE_KEYS.indexOf(this.vehicleKey);
+    this.vehicleKey = VEHICLE_KEYS[(i + dir + VEHICLE_KEYS.length) % VEHICLE_KEYS.length];
+    try { localStorage.setItem('pixeldriver.vehicle', this.vehicleKey); } catch (e) { /* ignore */ }
+    this.buildMenuCar();
   }
 
   buildMenuWorld() {
@@ -84,7 +99,7 @@ export class Game {
     const vx = this.world.vA.center(0);
     const hy = this.world.hA.center(0);
     // spawn heading up (-y) on the right-hand lane of vertical road 0
-    this.player = new PlayerCar(vx + 12, hy + 90, 0);
+    this.player = new PlayerCar(vx + 12, hy + 90, 0, VEHICLES[this.vehicleKey]);
     this.camera.x = this.player.x; this.camera.y = this.player.y;
     this.stats = {
       t: 0, dist: 0, topSpeed: 0, carsHit: 0, propsSmashed: 0,
@@ -129,6 +144,9 @@ export class Game {
       }
     }
     if (this.input.pressed('Backspace')) this.buildMenuWorld();
+    // vehicle select
+    if (this.input.pressed('ArrowLeft')) this.switchVehicle(-1);
+    if (this.input.pressed('ArrowRight')) this.switchVehicle(1);
     if (this.input.pressed('Enter')) {
       if (!this.seedStr.length) this.seedStr = randomSeedStr();
       this.sound.ensure();
@@ -334,24 +352,29 @@ export class Game {
     drawTextCentered(ctx, 'DRIFTER', W / 2 + 2, 64 + bob + 2, 4, 'rgba(0,0,0,0.6)');
     drawTextCentered(ctx, 'DRIFTER', W / 2, 64 + bob, 4, '#e05545');
 
-    // spinning car
+    // spinning selected vehicle
     ctx.save();
-    ctx.translate(W / 2, 120);
+    ctx.translate(W / 2, 116);
     ctx.rotate(Math.sin(this.menuT * 0.9) * 0.35 + 0.2);
-    ctx.scale(3, 3);
-    ctx.drawImage(this.menuCar.canvas, -6.5, -12);
+    ctx.scale(2, 2);
+    ctx.drawImage(this.menuCar.canvas, -this.menuCar.w / 2, -this.menuCar.h / 2);
     ctx.restore();
 
+    // vehicle selector: < NAME >  with tagline underneath
+    const v = VEHICLES[this.vehicleKey];
+    drawTextCentered(ctx, `< ${v.name} >`, W / 2, 154, 2, '#e8c33a');
+    drawTextCentered(ctx, v.tagline, W / 2, 172, 1, '#39d353');
+
     const blink = Math.floor(this.menuT * 2) % 2 === 0 ? '_' : ' ';
-    drawTextCentered(ctx, `SEED: ${this.seedStr}${blink}`, W / 2, 168, 2, '#ffffff');
-    drawTextCentered(ctx, 'TYPE TO CHANGE SEED', W / 2, 186, 1, '#8a8a94');
+    drawTextCentered(ctx, `SEED: ${this.seedStr}${blink}`, W / 2, 188, 1, '#ffffff');
+    drawTextCentered(ctx, 'TYPE: SEED    < > : VEHICLE', W / 2, 202, 1, '#8a8a94');
 
     if (Math.floor(this.menuT * 1.4) % 2 === 0) {
-      drawTextCentered(ctx, '- PRESS ENTER TO DRIVE -', W / 2, 210, 1, '#39d353');
+      drawTextCentered(ctx, '- PRESS ENTER TO DRIVE -', W / 2, 220, 1, '#39d353');
     }
-    drawTextCentered(ctx, 'WASD / ARROWS : DRIVE', W / 2, 236, 1, '#c8c8d0');
-    drawTextCentered(ctx, 'SPACE : HANDBRAKE   M : SOUND', W / 2, 248, 1, '#c8c8d0');
-    drawTextCentered(ctx, 'DRIVE UNTIL YOUR CAR IS TOTALED', W / 2, 268, 1, '#6a6a74');
+    drawTextCentered(ctx, 'WASD / ARROWS : DRIVE', W / 2, 242, 1, '#c8c8d0');
+    drawTextCentered(ctx, 'SPACE : HANDBRAKE   M : SOUND', W / 2, 254, 1, '#c8c8d0');
+    drawTextCentered(ctx, 'DRIVE UNTIL YOUR CAR IS TOTALED', W / 2, 270, 1, '#6a6a74');
   }
 
   renderDead(ctx) {

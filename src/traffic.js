@@ -425,54 +425,92 @@ export class Traffic {
         const rvx = va[0] - vb[0], rvy = va[1] - vb[1];
         const vn = rvx * nx + rvy * ny;
         const imp = Math.max(0, vn);
+        // masses drive the response; AI cars have no mass field (default 1).
+        const mA = A.mass || 1, mB = B.mass || 1, invSum = 1 / (mA + mB);
+        const isPA = A === env.player, isPB = B === env.player;
+        const ix = (pa[0] + pb[0]) / 2, iy = (pa[1] + pb[1]) / 2;
+
+        // positional separation (heavier body budges less) — always
+        const sep = R * 2 - d;
+        A.x -= nx * sep * mB * invSum; A.y -= ny * sep * mB * invSum;
+        B.x += nx * sep * mA * invSum; B.y += ny * sep * mA * invSum;
+
+        // A much-heavier player (truck/tank) doesn't trade momentum — it PUSHES.
+        // The car is carried up to the player's own speed along the contact
+        // normal, never launched faster, and the player barely slows.
+        if ((isPA && mA > mB * 1.5) || (isPB && mB > mA * 1.5)) {
+          const P = isPA ? A : B, C = isPA ? B : A;
+          const pdx = isPA ? nx : -nx, pdy = isPA ? ny : -ny; // player -> car
+          const pv = P.velocity ? P.velocity() : [P.vx, P.vy];
+          const cv = C.velocity ? C.velocity() : [C.vx, C.vy];
+          const pvp = pv[0] * pdx + pv[1] * pdy;  // player speed toward the car
+          const cvp = cv[0] * pdx + cv[1] * pdy;  // car speed along that dir
+          // carry the car up to the player's push speed along the normal (never
+          // below 0 — it can't keep driving into the player)...
+          const dvp = Math.max(cvp, Math.max(pvp, 0)) - cvp;
+          let ncx = cv[0] + dvp * pdx, ncy = cv[1] + dvp * pdy;
+          // ...then cap its total speed to the player's, so a push never leaves
+          // the car moving faster than the vehicle that shoved it.
+          const pSpeed = Math.hypot(pv[0], pv[1]), nSpeed = Math.hypot(ncx, ncy);
+          if (nSpeed > pSpeed && nSpeed > 0.01) { const s = pSpeed / nSpeed; ncx *= s; ncy *= s; }
+          C.applyHit(ix, iy, ncx - cv[0], ncy - cv[1], imp * (P.smashMul || 1), env);
+          // player sheds only a sliver of speed (mass-weighted soft stop)
+          if (vn > 0) {
+            const k = 1.8 * (isPA ? mB : mA) * invSum;
+            if (isPA) { A.vx -= vn * nx * k; A.vy -= vn * ny * k; }
+            else { B.vx += vn * nx * k; B.vy += vn * ny * k; }
+          }
+          if (imp > 22) { // real impact feedback (not steady pushing)
+            P.addDamage((imp - 22) * 0.07, env);
+            P.deformAtWorld(ix, iy, Math.min(1, imp / 180), env);
+            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) env.stats.carsHit++;
+            env.stats.lastCarHitT = env.t;
+            env.camera.addTrauma(Math.min(0.6, imp / 200) * (P.shakeMul || 1));
+            env.sound.crash(imp / 150);
+            env.particles.sparks(ix, iy, 5);
+          }
+          return;
+        }
+
+        // --- equal-ish masses: momentum-trading collision ---
         if (imp < 20) {
-          // gentle contact: separate, make driving AI yield — no crash physics
-          const push = (R * 2 - d) / 2;
-          A.x -= nx * push; A.y -= ny * push;
-          B.x += nx * push; B.y += ny * push;
+          // gentle contact: driving AI yields, player feels a soft stop
           if (A !== env.player && A.mode === 'drive') A.speed = Math.min(A.speed, 3);
           if (B !== env.player && B.mode === 'drive') B.speed = Math.min(B.speed, 3);
-          // the player still feels a soft stop
           if (vn > 0) {
-            if (A === env.player) { A.vx -= vn * nx * 0.9; A.vy -= vn * ny * 0.9; }
-            if (B === env.player) { B.vx += vn * nx * 0.9; B.vy += vn * ny * 0.9; }
+            if (isPA) { const k = 1.8 * mB * invSum; A.vx -= vn * nx * k; A.vy -= vn * ny * k; }
+            if (isPB) { const k = 1.8 * mA * invSum; B.vx += vn * nx * k; B.vy += vn * ny * k; }
           }
           continue;
         }
         const j = 0.68 * vn; // (1+e)/2 per body, e≈0.36
-        const ix = (pa[0] + pb[0]) / 2, iy = (pa[1] + pb[1]) / 2;
-
-        const isPlayerA = A === env.player, isPlayerB = B === env.player;
         // player side
-        if (isPlayerA || isPlayerB) {
-          const P = isPlayerA ? A : B;
-          const sgn = isPlayerA ? -1 : 1;
-          P.vx += sgn * j * nx;
-          P.vy += sgn * j * ny;
+        if (isPA || isPB) {
+          const P = isPA ? A : B;
+          const mP = isPA ? mA : mB, mO = isPA ? mB : mA;
+          const sgn = isPA ? -1 : 1;
+          const rec = j * 2 * mO / (mP + mO); // barely recoils when heavy (=j at parity)
+          P.vx += sgn * rec * nx;
+          P.vy += sgn * rec * ny;
           const rx = ix - P.x, ry = iy - P.y;
-          P.spin += (rx * (sgn * j * ny) - ry * (sgn * j * nx)) * -0.015;
+          P.spin += (rx * (sgn * rec * ny) - ry * (sgn * rec * nx)) * -0.015;
           if (imp > 22) {
             P.addDamage((imp - 22) * 0.07, env);
             P.deformAtWorld(ix, iy, Math.min(1, imp / 180), env);
             if (env.t - (env.stats.lastCarHitT || -1) > 0.5) env.stats.carsHit++;
             env.stats.lastCarHitT = env.t;
-            env.camera.addTrauma(Math.min(0.7, imp / 170));
+            env.camera.addTrauma(Math.min(0.7, imp / 170) * (P.shakeMul || 1));
             env.sound.crash(imp / 150);
             env.particles.sparks(ix, iy, 5);
           }
         }
         // AI sides
-        if (!isPlayerA) A.applyHit(ix, iy, -j * nx, -j * ny, imp, env);
-        if (!isPlayerB) B.applyHit(ix, iy, j * nx, j * ny, imp, env);
-        if (!isPlayerA && !isPlayerB && imp > 25) {
+        if (!isPA) A.applyHit(ix, iy, -j * nx, -j * ny, imp, env);
+        if (!isPB) B.applyHit(ix, iy, j * nx, j * ny, imp, env);
+        if (!isPA && !isPB && imp > 25) {
           env.sound.crash(imp / 220);
           env.particles.sparks(ix, iy, 4);
         }
-
-        // positional separation
-        const push = (R * 2 - d) / 2;
-        A.x -= nx * push; A.y -= ny * push;
-        B.x += nx * push; B.y += ny * push;
         return;
       }
     }
