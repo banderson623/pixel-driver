@@ -1,6 +1,8 @@
 // Cars are grids of individual pixels ("voxels"). Collisions dent and tear
 // pixels off. The player car uses an arcade drift model tuned to oversteer.
 
+import { tuning as T } from './tuning.js';
+
 export const CAR_W = 13, CAR_H = 24;
 
 const PROFILE = [7, 9, 11, 11, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 11, 11, 11, 9, 9];
@@ -151,11 +153,8 @@ const HULL = [];
   HULL.push([0, hh], [-hw + 2, hh - 1], [hw - 2, hh - 1]);              // tail
 }
 
-const VMAX = 260;
-const ACCEL = 195;
-const BRAKE = 340;
 const REV_MAX = 80;
-const DRAG = 0.34;
+const AXLE = 8;          // half wheelbase (px)
 
 // Two-axle drift model. Each axle tries to cancel its lateral velocity
 // (a damper, gain K_LAT) but the correcting force is capped by that axle's
@@ -165,19 +164,10 @@ const DRAG = 0.34;
 // handbrake all but removes it. Yaw is integrated for real: rear breakaway
 // rotates the car into the drift, and finite front grip lets counter-steer
 // catch it.
-const AXLE = 8;          // half wheelbase (px)
-const INERTIA = 48;
-const K_LAT = 16;        // lateral damping gain (1/s); higher = snappier grip
-const GRIP_F = 250;      // front axle grip limit (px/s^2)
-const GRIP_R = 295;      // rear axle grip limit
-const KINETIC = 0.5;     // grip fraction left once a tire lets go
-const HB_REAR = 0.14;    // rear grip fraction under handbrake
-const THROTTLE_DRAIN = 0.5; // how much full throttle eats rear grip
-const STEER_MAX = 0.55;  // max wheel angle (rad), fades with speed
-const STEER_RATE = 10;        // base wheel-swing speed (1/s) when gripping
-const STEER_RATE_DRIFT = 13; // extra swing speed added at full slide (catch counter-steer)
-const OMEGA_DAMP = 0.9;  // yaw damping (spin-out protection)
-const OMEGA_MAX = 3.2;
+//
+// Every knob below (STEER_MAX, GRIP_F/R, KINETIC, DRAG, ...) lives in
+// tuning.js and is read through `T` each frame, so the on-screen sliders
+// change the handling live. See tuning.js for defaults and ranges.
 // Speed kept when plowing through a prop. Props are soft (see PROP_SOFTNESS in
 // world.js): 10% of the former 8% scrub, so smashing one barely slows you.
 const PROP_SMASH_KEEP = 1 - 0.08 * 0.1; // = 0.992
@@ -223,7 +213,7 @@ export class PlayerCar {
     // steering response: the wheel swings faster the harder you're sliding,
     // so counter-steer snaps over quickly enough to catch a drift
     const target = steer;
-    const rate = STEER_RATE + this.skidLevel * STEER_RATE_DRIFT; // ~7 gripping, ~20 in a full slide
+    const rate = T.STEER_RATE + this.skidLevel * T.STEER_RATE_DRIFT; // ~7 gripping, ~20 in a full slide
     this.steerS += (target - this.steerS) * Math.min(1, rate * dt);
 
     this.step(dt / 2, throttle, brake, hand, env);
@@ -264,38 +254,43 @@ export class PlayerCar {
     const surf = env.world.surfaceDrag(this.x, this.y);
     let driveFrac = 0;
     if (throttle) {
-      vf += ACCEL * (1 - 0.55 * Math.max(0, vf) / VMAX) * dt;
+      vf += T.ACCEL * (1 - 0.55 * Math.max(0, vf) / T.VMAX) * dt;
       driveFrac = 1;
     }
     if (brake) {
-      if (vf > 5) vf -= BRAKE * dt;
-      else vf = Math.max(-REV_MAX, vf - ACCEL * 0.55 * dt);
+      if (vf > 5) vf -= T.BRAKE * dt;
+      else vf = Math.max(-REV_MAX, vf - T.ACCEL * 0.55 * dt);
     }
-    vf -= vf * DRAG * surf * dt;
-    if (hand) vf *= Math.exp(-0.6 * dt); // locked rears scrub speed
+    vf -= vf * T.DRAG * surf * dt;
+    if (hand) {
+      // locked rears scrub speed; 10x stronger below 15 mph so the handbrake
+      // hauls the car down to a stop hard once you're already slow
+      const hbRate = Math.abs(vf) * 0.425 < 15 ? 6.0 : 0.6;
+      vf *= Math.exp(-hbRate * dt);
+    }
     this.vx = fwd[0] * vf + right[0] * vl0;
     this.vy = fwd[1] * vf + right[1] * vl0;
 
     // --- steering: wheel angle shrinks with speed for high-speed stability,
     // but a slide restores most of that lock so you keep the authority to
     // counter-steer and hold the drift ---
-    const speedAtten = 1 + (Math.abs(vf) / 170) * (1 - 0.75 * this.skidLevel);
-    const delta = this.steerS * STEER_MAX / speedAtten;
+    const speedAtten = 1 + (Math.abs(vf) / T.STEER_FALLOFF) * (1 - 0.75 * this.skidLevel);
+    const delta = this.steerS * T.STEER_MAX / speedAtten;
 
     // --- axle grip limits (traction circle: throttle drains the rear) ---
     const gscale = 1 / Math.sqrt(surf); // grass/dirt slide much sooner
-    const frontLimit = GRIP_F * gscale;
-    const rearLimit = GRIP_R * gscale *
-      (1 - THROTTLE_DRAIN * driveFrac * Math.min(1, Math.abs(vf) / 60 + 0.4)) *
-      (hand ? HB_REAR : 1);
+    const frontLimit = T.GRIP_F * gscale;
+    const rearLimit = T.GRIP_R * gscale *
+      (1 - T.THROTTLE_DRAIN * driveFrac * Math.min(1, Math.abs(vf) / 60 + 0.4)) *
+      (hand ? T.HB_REAR : 1);
 
     const frontSlide = this.axle(1, delta, frontLimit, dt);
     const rearSlide = this.axle(-1, 0, rearLimit, dt);
 
     // yaw damping + cap: the "don't spin out" guards
-    this.spin *= Math.exp(-OMEGA_DAMP * dt);
-    if (this.spin > OMEGA_MAX) this.spin = OMEGA_MAX;
-    else if (this.spin < -OMEGA_MAX) this.spin = -OMEGA_MAX;
+    this.spin *= Math.exp(-T.OMEGA_DAMP * dt);
+    if (this.spin > T.OMEGA_MAX) this.spin = T.OMEGA_MAX;
+    else if (this.spin < -T.OMEGA_MAX) this.spin = -T.OMEGA_MAX;
     this.heading += this.spin * dt;
 
     // skid intensity drives smoke, marks and sound (rear-biased)
@@ -328,13 +323,13 @@ export class PlayerCar {
     const wrx = right[0] * cs - right[1] * sn;
     const wry = right[0] * sn + right[1] * cs;
     const lat = avx * wrx + avy * wry;
-    const demand = K_LAT * lat;
+    const demand = T.K_LAT * lat;
     const excess = Math.abs(demand) / limit;
-    const a = excess > 1 ? Math.sign(demand) * limit * KINETIC : demand;
+    const a = excess > 1 ? Math.sign(demand) * limit * T.KINETIC : demand;
     // half the mass rides on each axle
     this.vx -= wrx * a * dt * 0.5;
     this.vy -= wry * a * dt * 0.5;
-    this.spin += (rx * wry - ry * wrx) * -0.5 * a / INERTIA * dt;
+    this.spin += (rx * wry - ry * wrx) * -0.5 * a / T.INERTIA * dt;
     return excess;
   }
 

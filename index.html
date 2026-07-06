@@ -10,6 +10,41 @@
     image-rendering:pixelated;image-rendering:crisp-edges;
     outline:2px solid #1c1c26;
   }
+
+  /* Live handling tuner panel */
+  #tuner{
+    position:fixed;top:12px;right:12px;width:220px;max-height:calc(100vh - 24px);
+    display:flex;flex-direction:column;
+    background:rgba(16,16,22,0.94);border:1px solid #2a2a36;border-radius:6px;
+    font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#c8c8d0;
+    box-shadow:0 6px 24px rgba(0,0,0,0.5);user-select:none;z-index:10;
+  }
+  .tuner-header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:7px 10px;background:#20202c;border-bottom:1px solid #2a2a36;
+    border-radius:6px 6px 0 0;letter-spacing:1px;color:#e8c33a;font-weight:bold;
+  }
+  .tuner-collapse{
+    background:none;border:none;color:#c8c8d0;font-size:15px;line-height:1;
+    cursor:pointer;padding:0 4px;
+  }
+  #tuner.collapsed .tuner-body{display:none;}
+  .tuner-body{overflow-y:auto;padding:6px 10px 10px;}
+  .tuner-group{
+    margin:10px 0 4px;color:#7a7a86;letter-spacing:1px;text-transform:uppercase;
+    font-size:9px;border-bottom:1px solid #23232e;padding-bottom:2px;
+  }
+  .tuner-row{display:block;margin:5px 0;}
+  .tuner-toprow{display:flex;justify-content:space-between;align-items:baseline;}
+  .tuner-name{color:#b8b8c2;}
+  .tuner-val{color:#39d353;font-variant-numeric:tabular-nums;}
+  .tuner-row input[type=range]{width:100%;margin:2px 0 0;accent-color:#e05545;height:14px;}
+  .tuner-actions{display:flex;gap:4px;margin-top:12px;}
+  .tuner-actions button{
+    flex:1;background:#2a2a38;border:1px solid #3a3a48;color:#d8d8e0;
+    border-radius:4px;padding:5px 2px;cursor:pointer;font:inherit;font-size:10px;
+  }
+  .tuner-actions button:hover{background:#34344a;}
 </style>
 </head>
 <body>

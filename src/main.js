@@ -1,8 +1,11 @@
 import { Game } from './game.js';
+import { initTuner } from './tuner.js';
 
 const canvas = document.getElementById('game');
 const game = new Game(canvas);
 window.__game = game; // debugging handle
+
+initTuner(); // live handling sliders (loads saved tuning from localStorage)
 
 let last = performance.now();
 let acc = 0;
