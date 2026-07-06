@@ -9,12 +9,33 @@ import { hash3 } from './rng.js';
 const LANE = 12;
 const BIKE_LANE = LANE + 7; // cyclists hug the curb
 const TARGET_AI = 13;
-const BIKE_FRAC = 0.3;      // share of driving spawns that are cyclists
 const DESPAWN_R = 580;
 
 const BIKE_SHIRTS = ['#d24b4b', '#3f78d2', '#3fae55', '#d2a53a', '#8f4fd2', '#31b0b0'];
 const BIKE_SKIN = ['#caa07a', '#a5744c', '#e3b98f', '#8a5a34'];
 const BIKE_FRAMES = ['#2a2a30', '#39424e', '#4a2f2f', '#2f4a3a'];
+
+// AI vehicle roster. len/wid drive collision footprint & drawing; mass makes
+// the big rigs shove the player around; hp sets how much abuse they take.
+const TYPES = {
+  car:        { len: 24, wid: 13, cruiseLo: 55, cruiseHi: 90,  mass: 1, hpLo: 55,  hpHi: 85 },
+  motorcycle: { len: 14, wid: 5,  cruiseLo: 62, cruiseHi: 104, mass: 1, hpLo: 10,  hpHi: 18 },
+  schoolbus:  { len: 46, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 5, hpLo: 150, hpHi: 210 },
+  citybus:    { len: 48, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 5, hpLo: 150, hpHi: 210 },
+  dumptruck:  { len: 34, wid: 15, cruiseLo: 46, cruiseHi: 66,  mass: 5, hpLo: 160, hpHi: 220 },
+  gastruck:   { len: 56, wid: 14, cruiseLo: 42, cruiseHi: 60,  mass: 6, hpLo: 170, hpHi: 230 },
+  bike:       { len: 11, wid: 4,  cruiseLo: 30, cruiseHi: 46,  mass: 1, hpLo: 1,   hpHi: 4 },
+};
+// spawn probabilities (cumulative); the remainder to 1.0 is plain cars
+const SPAWN_MIX = [
+  ['bike', 0.20], ['motorcycle', 0.08], ['schoolbus', 0.06],
+  ['citybus', 0.06], ['dumptruck', 0.06], ['gastruck', 0.05],
+];
+function pickType(r) {
+  let acc = 0;
+  for (const [kind, p] of SPAWN_MIX) { acc += p; if (r < acc) return kind; }
+  return 'car';
+}
 
 function qbez(p0, p1, p2, t) {
   const u = 1 - t;
@@ -57,23 +78,27 @@ export class AICar {
     this.k = opts.k || 0;
     this.dir = opts.dir || 1;
     this.speed = 0;
-    this.cruise = 55 + Math.random() * 35;
     this.vx = 0; this.vy = 0;
     this.spinv = 0;
     this.shoveT = 0;
-    this.hp = 55 + Math.random() * 30;
     this.action = 'straight';
     this.turn = null;
     this.parkedOrigin = this.mode === 'parked';
     const scheme = AI_COLORS[Math.floor(Math.random() * AI_COLORS.length)];
     this.body = new CarBody(scheme[0], scheme[1]);
     this.smokeAcc = 0;
-    // cyclists: obey the same lanes/lights/turns as cars, just slower, curb-side
-    this.bike = opts.kind === 'bike';
+
+    // vehicle type — same lane/light/turn rules for all, differing in size
+    // (collision footprint via half/rad), speed, mass, durability and looks.
+    this.type = opts.kind || 'car';
+    this.bike = this.type === 'bike';
+    const cfg = TYPES[this.type] || TYPES.car;
+    this.half = cfg.len / 2; this.rad = cfg.wid / 2;
+    this.mass = cfg.mass;
+    this.cruise = cfg.cruiseLo + Math.random() * (cfg.cruiseHi - cfg.cruiseLo);
+    this.hp = cfg.hpLo + Math.random() * (cfg.hpHi - cfg.hpLo);
     this.laneOff = this.bike ? BIKE_LANE : LANE;
-    if (this.bike) {
-      this.cruise = 30 + Math.random() * 16;
-      this.hp = 1 + Math.random() * 3;   // as fragile as a pedestrian
+    if (this.bike || this.type === 'motorcycle') { // has a visible rider
       this.frame = BIKE_FRAMES[Math.floor(Math.random() * BIKE_FRAMES.length)];
       this.shirt = BIKE_SHIRTS[Math.floor(Math.random() * BIKE_SHIRTS.length)];
       this.skin = BIKE_SKIN[Math.floor(Math.random() * BIKE_SKIN.length)];
@@ -327,24 +352,76 @@ export class AICar {
     ctx.save();
     ctx.translate(Math.round(this.x - camX), Math.round(this.y - camY));
     ctx.rotate(this.heading);
-    if (this.bike) this.drawBike(ctx);
-    else ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2);
+    switch (this.type) {
+      case 'bike': this.drawBike(ctx); break;
+      case 'motorcycle': this.drawMotorcycle(ctx); break;
+      case 'schoolbus': this.drawBus(ctx, '#e6b400', '#2e2610', true); break;
+      case 'citybus': this.drawBus(ctx, '#cbced4', '#c23b3b', false); break;
+      case 'dumptruck': this.drawDumpTruck(ctx); break;
+      case 'gastruck': this.drawGasTruck(ctx); break;
+      default: ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2);
+    }
     ctx.restore();
   }
 
-  // Top-down cyclist, drawn in local space (heading 0 = nose toward -y).
+  // All drawn in local space, heading 0 = nose toward -y, body spanning
+  // [-rad,rad] x [-half,half].
   drawBike(ctx) {
     ctx.fillStyle = 'rgba(0,0,0,0.22)';
-    ctx.fillRect(-1, -3, 3, 7);            // shadow
+    ctx.fillRect(-1, -3, 3, 7);
     ctx.fillStyle = '#141418';
-    ctx.fillRect(-1, -4, 2, 2);            // front wheel
-    ctx.fillRect(-1, 2, 2, 2);             // rear wheel
-    ctx.fillStyle = this.frame;
-    ctx.fillRect(-1, -3, 2, 6);            // frame
-    ctx.fillStyle = this.shirt;
-    ctx.fillRect(-1, -1, 2, 3);            // rider torso
-    ctx.fillStyle = this.skin;
-    ctx.fillRect(-1, -2, 2, 1);            // head
+    ctx.fillRect(-1, -4, 2, 2); ctx.fillRect(-1, 2, 2, 2); // wheels
+    ctx.fillStyle = this.frame; ctx.fillRect(-1, -3, 2, 6);
+    ctx.fillStyle = this.shirt; ctx.fillRect(-1, -1, 2, 3);
+    ctx.fillStyle = this.skin; ctx.fillRect(-1, -2, 2, 1);
+  }
+
+  drawMotorcycle(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(-2, -6, 4, 12);
+    ctx.fillStyle = '#141418';
+    ctx.fillRect(-1, -6, 2, 3); ctx.fillRect(-1, 3, 2, 3);  // fat tires
+    ctx.fillStyle = this.frame; ctx.fillRect(-2, -3, 4, 6); // fairing/engine
+    ctx.fillStyle = this.shirt; ctx.fillRect(-1, -1, 2, 3); // rider
+    ctx.fillStyle = this.skin; ctx.fillRect(-1, -3, 2, 1);  // helmet
+  }
+
+  drawBus(ctx, body, accent, school) {
+    const w = this.rad, h = this.half;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -h + 1, w * 2 + 1, h * 2);
+    ctx.fillStyle = body; ctx.fillRect(-w, -h, w * 2, h * 2);
+    ctx.fillStyle = accent;                                 // trim
+    ctx.fillRect(-w, -h, 1, h * 2); ctx.fillRect(w - 1, -h, 1, h * 2);
+    ctx.fillRect(-w, h - 1, w * 2, 1);
+    ctx.fillStyle = '#20303c'; ctx.fillRect(-w + 1, -h + 1, w * 2 - 2, 3); // windshield
+    ctx.fillStyle = '#3a5a6a';                              // side windows
+    for (let y = -h + 6; y < h - 3; y += 5) { ctx.fillRect(-w, y, 1, 3); ctx.fillRect(w - 1, y, 1, 3); }
+    ctx.fillStyle = accent; ctx.fillRect(-1, -h + 6, 2, h * 2 - 9); // roof ridge
+    if (school) { ctx.fillStyle = '#111'; ctx.fillRect(-w, -h + 4, w * 2, 1); }
+  }
+
+  drawDumpTruck(ctx) {
+    const w = this.rad, h = this.half, cab = h * 2 * 0.34;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -h + 1, w * 2 + 1, h * 2);
+    ctx.fillStyle = '#d0902f'; ctx.fillRect(-w, -h, w * 2, cab);            // cab
+    ctx.fillStyle = '#20303c'; ctx.fillRect(-w + 1, -h + 1, w * 2 - 2, 2);  // windshield
+    ctx.fillStyle = '#5a5e66'; ctx.fillRect(-w, -h + cab, w * 2, h * 2 - cab); // bed walls
+    ctx.fillStyle = '#6e5637'; ctx.fillRect(-w + 2, -h + cab + 1, w * 2 - 4, h * 2 - cab - 3); // gravel
+    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, -h, 1, h * 2); ctx.fillRect(w - 1, -h, 1, h * 2);
+  }
+
+  drawGasTruck(ctx) {
+    const w = this.rad, h = this.half, L = h * 2;
+    const cab1 = -h + L * 0.26, tank0 = -h + L * 0.32;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -h + 1, w * 2 + 1, L);
+    ctx.fillStyle = '#c23b3b'; ctx.fillRect(-w, -h, w * 2, cab1 - (-h));    // cab
+    ctx.fillStyle = '#20303c'; ctx.fillRect(-w + 1, -h + 1, w * 2 - 2, 2);
+    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-1, cab1, 2, tank0 - cab1);     // hitch
+    ctx.fillStyle = '#c8ccd2'; ctx.fillRect(-w, tank0, w * 2, h - tank0);   // silver tank
+    ctx.fillStyle = '#9aa0a8'; ctx.fillRect(-w, tank0, 1, h - tank0); ctx.fillRect(w - 1, tank0, 1, h - tank0);
+    ctx.fillStyle = '#e6e9ee'; ctx.fillRect(-1, tank0, 2, h - tank0);       // highlight ridge
+    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, tank0 + (h - tank0) * 0.5, w * 2, 1); // strap
+    ctx.fillStyle = '#e05545'; ctx.fillRect(-2, h - 4, 4, 3);               // hazard placard
   }
 }
 
@@ -415,8 +492,8 @@ export class Traffic {
       const dist = 260 + Math.random() * 180;
       const side = Math.random() < 0.5 ? 1 : -1;
       const posAlong = along + side * dist;
-      const isBike = Math.random() < BIKE_FRAC;
-      const off = isBike ? BIKE_LANE : LANE;
+      const kind = pickType(Math.random());
+      const off = kind === 'bike' ? BIKE_LANE : LANE;
       const perp = useV ? -dir : dir;
       const x = useV ? roadC + perp * off : posAlong;
       const y = useV ? posAlong : roadC + perp * off;
@@ -429,7 +506,7 @@ export class Traffic {
       const dv = useV ? [0, dir] : [dir, 0];
       const car = new AICar(x, y, {
         axis: useV ? 'v' : 'h', k, dir,
-        heading: headingOf(dv[0], dv[1]), kind: isBike ? 'bike' : 'car',
+        heading: headingOf(dv[0], dv[1]), kind,
       });
       car.speed = car.cruise * 0.7;
       car.chooseAction();
@@ -446,24 +523,34 @@ export class Traffic {
       for (let b = a + 1; b < bodies.length; b++) {
         const A = bodies[a], B = bodies[b];
         const dx = B.x - A.x, dy = B.y - A.y;
-        if (dx * dx + dy * dy > 40 * 40) continue;
+        const reach = (A.half || 6) + (B.half || 6) + (A.rad || 7) + (B.rad || 7);
+        if (dx * dx + dy * dy > reach * reach) continue;
         this.resolvePair(A, B, env);
       }
     }
   }
 
   resolvePair(A, B, env) {
-    const centers = (c) => {
+    // sample a row of collision circles along each body's length so long
+    // buses/trucks collide over their whole footprint, not just the center
+    const samples = (c) => {
       const f = c.forward ? c.forward() : [Math.sin(c.heading), -Math.cos(c.heading)];
-      return [[c.x + f[0] * 6, c.y + f[1] * 6], [c.x - f[0] * 6, c.y - f[1] * 6]];
+      const r = c.rad || 7, half = Math.max(0, (c.half || 6) - r);
+      const n = Math.max(2, Math.round((half * 2) / r) + 1);
+      const out = [];
+      for (let i = 0; i < n; i++) {
+        const t = n === 1 ? 0 : -half + (2 * half) * i / (n - 1);
+        out.push([c.x + f[0] * t, c.y + f[1] * t]);
+      }
+      return out;
     };
-    const R = 7;
-    const ca = centers(A), cb = centers(B);
+    const sum = (A.rad || 7) + (B.rad || 7);
+    const ca = samples(A), cb = samples(B);
     for (const pa of ca) {
       for (const pb of cb) {
         const dx = pb[0] - pa[0], dy = pb[1] - pa[1];
         const d = Math.hypot(dx, dy);
-        if (d >= R * 2) continue;
+        if (d >= sum) continue;
         const nx = d > 0.01 ? dx / d : 1, ny = d > 0.01 ? dy / d : 0;
         const va = A.velocity ? A.velocity() : [A.vx, A.vy];
         const vb = B.velocity ? B.velocity() : [B.vx, B.vy];
@@ -476,7 +563,7 @@ export class Traffic {
         const ix = (pa[0] + pb[0]) / 2, iy = (pa[1] + pb[1]) / 2;
 
         // positional separation (heavier body budges less) — always
-        const sep = R * 2 - d;
+        const sep = sum - d;
         A.x -= nx * sep * mB * invSum; A.y -= ny * sep * mB * invSum;
         B.x += nx * sep * mA * invSum; B.y += ny * sep * mA * invSum;
 
@@ -583,7 +670,8 @@ export class Traffic {
 
   draw(ctx, camX, camY, W, H) {
     for (const c of this.cars) {
-      if (Math.abs(c.x - camX) > W / 2 + 30 || Math.abs(c.y - camY) > H / 2 + 30) continue;
+      const m = (c.half || 12) + 8;
+      if (Math.abs(c.x - camX) > W / 2 + m || Math.abs(c.y - camY) > H / 2 + m) continue;
       c.draw(ctx, camX - W / 2, camY - H / 2);
     }
   }

@@ -279,6 +279,8 @@ export class PlayerCar {
     this.hull = makeHull(this.body.w, this.body.h);
     this.collR = this.body.w / 2;                     // prop-collision radius
     this.collOff = this.body.h / 2 - this.body.w / 2; // front/rear circle offset
+    this.rad = this.body.w / 2;                       // car-vs-car footprint (see traffic.js)
+    this.half = this.body.h / 2;
   }
 
   forward() { return [Math.sin(this.heading), -Math.cos(this.heading)]; }
