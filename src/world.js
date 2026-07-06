@@ -610,6 +610,13 @@ export class World {
 
   solidAt(wx, wy) { return isSolidIdx(this.cellAt(wx, wy)); }
 
+  // True when (wx,wy) sits on drivable asphalt/lane markings — used to flag
+  // off-road excursions. Sidewalks, curbs, grass, plazas and rubble are not.
+  isRoad(wx, wy) {
+    const c = this.cellAt(wx, wy);
+    return c === T.ASPH || c === T.ASPH2 || c === T.LANEY || c === T.LANEW || c === T.CROSS;
+  }
+
   surfaceDrag(wx, wy) {
     const c = this.cellAt(wx, wy);
     if (c === T.GRASS || c === T.GRASS2) return 2.1;

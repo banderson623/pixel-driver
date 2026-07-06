@@ -2,6 +2,7 @@
 // pixels off. The player car uses an arcade drift model tuned to oversteer.
 
 import { tuning as T } from './tuning.js';
+import { countWreck } from './traffic.js';
 
 // Default (sports car) dimensions. Traffic cars use these directly.
 export const CAR_W = 13, CAR_H = 24;
@@ -485,6 +486,7 @@ export class PlayerCar {
       this.deformAtWorld(hitX, hitY, Math.min(1, impact / 190), env);
       env.particles.sparks(hitX, hitY, 4);
       env.sound.crash(impact / 170);
+      countWreck(env);
       env.camera.addTrauma(Math.min(0.75, impact / 190) * this.shakeMul);
       world.decal(hitX, hitY, (g) => {
         g.fillStyle = 'rgba(15,15,18,0.35)';

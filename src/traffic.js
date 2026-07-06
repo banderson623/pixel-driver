@@ -7,8 +7,14 @@ import { ROAD_HALF } from './world.js';
 import { hash3 } from './rng.js';
 
 const LANE = 12;
+const BIKE_LANE = LANE + 7; // cyclists hug the curb
 const TARGET_AI = 13;
+const BIKE_FRAC = 0.3;      // share of driving spawns that are cyclists
 const DESPAWN_R = 580;
+
+const BIKE_SHIRTS = ['#d24b4b', '#3f78d2', '#3fae55', '#d2a53a', '#8f4fd2', '#31b0b0'];
+const BIKE_SKIN = ['#caa07a', '#a5744c', '#e3b98f', '#8a5a34'];
+const BIKE_FRAMES = ['#2a2a30', '#39424e', '#4a2f2f', '#2f4a3a'];
 
 function qbez(p0, p1, p2, t) {
   const u = 1 - t;
@@ -26,6 +32,17 @@ function lerpAngle(a, b, t) {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return a + d * t;
+}
+
+// A "wreck" infraction: any major collision (car-to-car or into a building).
+// Shared 0.6s debounce so one crash counts once even with several contacts.
+export function countWreck(env) {
+  const s = env.stats;
+  if (!s || !s.infractions) return;
+  if (env.t - (s.lastWreckT || -10) < 0.6) return;
+  s.lastWreckT = env.t;
+  s.infractions.wreck++;
+  s.lastInfractionT = env.t;
 }
 
 let uid = 1;
@@ -51,6 +68,16 @@ export class AICar {
     const scheme = AI_COLORS[Math.floor(Math.random() * AI_COLORS.length)];
     this.body = new CarBody(scheme[0], scheme[1]);
     this.smokeAcc = 0;
+    // cyclists: obey the same lanes/lights/turns as cars, just slower, curb-side
+    this.bike = opts.kind === 'bike';
+    this.laneOff = this.bike ? BIKE_LANE : LANE;
+    if (this.bike) {
+      this.cruise = 30 + Math.random() * 16;
+      this.hp = 1 + Math.random() * 3;   // as fragile as a pedestrian
+      this.frame = BIKE_FRAMES[Math.floor(Math.random() * BIKE_FRAMES.length)];
+      this.shirt = BIKE_SHIRTS[Math.floor(Math.random() * BIKE_SHIRTS.length)];
+      this.skin = BIKE_SKIN[Math.floor(Math.random() * BIKE_SKIN.length)];
+    }
   }
 
   dirVec() { return this.axis === 'v' ? [0, this.dir] : [this.dir, 0]; }
@@ -97,7 +124,7 @@ export class AICar {
     // lane keeping: right-hand traffic
     // perp(dx,dy) = (-dy,dx): lane center = road center + perp*LANE
     const perp = this.axis === 'v' ? -this.dir : this.dir;
-    const laneC = roadC + perp * LANE;
+    const laneC = roadC + perp * this.laneOff;
     const latFix = (laneC - posLat) * Math.min(1, 4 * dt);
 
     // next crossing road
@@ -300,8 +327,24 @@ export class AICar {
     ctx.save();
     ctx.translate(Math.round(this.x - camX), Math.round(this.y - camY));
     ctx.rotate(this.heading);
-    ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2);
+    if (this.bike) this.drawBike(ctx);
+    else ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2);
     ctx.restore();
+  }
+
+  // Top-down cyclist, drawn in local space (heading 0 = nose toward -y).
+  drawBike(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.22)';
+    ctx.fillRect(-1, -3, 3, 7);            // shadow
+    ctx.fillStyle = '#141418';
+    ctx.fillRect(-1, -4, 2, 2);            // front wheel
+    ctx.fillRect(-1, 2, 2, 2);             // rear wheel
+    ctx.fillStyle = this.frame;
+    ctx.fillRect(-1, -3, 2, 6);            // frame
+    ctx.fillStyle = this.shirt;
+    ctx.fillRect(-1, -1, 2, 3);            // rider torso
+    ctx.fillStyle = this.skin;
+    ctx.fillRect(-1, -2, 2, 1);            // head
   }
 }
 
@@ -372,9 +415,11 @@ export class Traffic {
       const dist = 260 + Math.random() * 180;
       const side = Math.random() < 0.5 ? 1 : -1;
       const posAlong = along + side * dist;
+      const isBike = Math.random() < BIKE_FRAC;
+      const off = isBike ? BIKE_LANE : LANE;
       const perp = useV ? -dir : dir;
-      const x = useV ? roadC + perp * LANE : posAlong;
-      const y = useV ? posAlong : roadC + perp * LANE;
+      const x = useV ? roadC + perp * off : posAlong;
+      const y = useV ? posAlong : roadC + perp * off;
       if (Math.hypot(x - player.x, y - player.y) < 240) continue;
       let blocked = false;
       for (const c of this.cars) {
@@ -384,7 +429,7 @@ export class Traffic {
       const dv = useV ? [0, dir] : [dir, 0];
       const car = new AICar(x, y, {
         axis: useV ? 'v' : 'h', k, dir,
-        heading: headingOf(dv[0], dv[1]),
+        heading: headingOf(dv[0], dv[1]), kind: isBike ? 'bike' : 'car',
       });
       car.speed = car.cruise * 0.7;
       car.chooseAction();
@@ -435,6 +480,26 @@ export class Traffic {
         A.x -= nx * sep * mB * invSum; A.y -= ny * sep * mB * invSum;
         B.x += nx * sep * mA * invSum; B.y += ny * sep * mA * invSum;
 
+        // Cyclists are as fragile as pedestrians: the player plows straight
+        // through, flinging the rider and totalling the bike, taking no damage
+        // and barely slowing.
+        if ((isPA && B.bike) || (isPB && A.bike)) {
+          if (imp > 6) {
+            const bike = isPA ? B : A;
+            const dirx = isPA ? nx : -nx, diry = isPA ? ny : -ny;
+            const fling = Math.max(imp, 70) * 1.3;
+            bike.hp = -999;
+            bike.applyHit(ix, iy, dirx * fling, diry * fling, imp, env);
+            env.sound.thud();
+            env.camera.addTrauma(0.22 * (env.player.shakeMul || 1));
+            env.particles.debris(ix, iy, '#8a1414', 3, 70);
+            env.particles.sparks(ix, iy, 3);
+            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) { env.stats.carsHit++; countWreck(env); }
+            env.stats.lastCarHitT = env.t;
+          }
+          return;
+        }
+
         // A much-heavier player (truck/tank) doesn't trade momentum — it PUSHES.
         // The car is carried up to the player's own speed along the contact
         // normal, never launched faster, and the player barely slows.
@@ -463,7 +528,7 @@ export class Traffic {
           if (imp > 22) { // real impact feedback (not steady pushing)
             P.addDamage((imp - 22) * 0.07, env);
             P.deformAtWorld(ix, iy, Math.min(1, imp / 180), env);
-            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) env.stats.carsHit++;
+            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) { env.stats.carsHit++; countWreck(env); }
             env.stats.lastCarHitT = env.t;
             env.camera.addTrauma(Math.min(0.6, imp / 200) * (P.shakeMul || 1));
             env.sound.crash(imp / 150);
@@ -497,7 +562,7 @@ export class Traffic {
           if (imp > 22) {
             P.addDamage((imp - 22) * 0.07, env);
             P.deformAtWorld(ix, iy, Math.min(1, imp / 180), env);
-            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) env.stats.carsHit++;
+            if (env.t - (env.stats.lastCarHitT || -1) > 0.5) { env.stats.carsHit++; countWreck(env); }
             env.stats.lastCarHitT = env.t;
             env.camera.addTrauma(Math.min(0.7, imp / 170) * (P.shakeMul || 1));
             env.sound.crash(imp / 150);
