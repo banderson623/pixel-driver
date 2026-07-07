@@ -163,22 +163,35 @@ export class AICar {
     const dx = tx - this.x, dy = ty - this.y;
     let desired = headingOf(dx, dy);
 
-    // building avoidance: if something solid is dead ahead, steer toward
-    // whichever side has more clearance
-    const look = 16 + this.speed * 0.28;
-    const f = [Math.sin(this.heading), -Math.cos(this.heading)];
-    if (world.solidAt(this.x + f[0] * look, this.y + f[1] * look)) {
-      const clear = (ang) => {
-        const s = Math.sin(this.heading + ang), c = -Math.cos(this.heading + ang);
-        for (let d = 6; d <= look; d += 4) if (world.solidAt(this.x + s * d, this.y + c * d)) return d;
-        return look + 1;
-      };
-      desired = this.heading + (clear(-0.9) >= clear(0.9) ? -0.9 : 0.9);
+    // obstacle avoidance: cast forward whiskers that detect buildings AND
+    // vehicles (parked cars, traffic, other cruisers) and steer around whatever
+    // is in the way, easing off the throttle as it closes in
+    const look = 20 + this.speed * 0.4;
+    const near = [];
+    for (const o of env.obstacles) {
+      if (o === this || o === player || o.exploded) continue;
+      if ((o.x - this.x) ** 2 + (o.y - this.y) ** 2 < (look + 24) * (look + 24)) near.push(o);
+    }
+    const clearDist = (ang) => {
+      const s = Math.sin(this.heading + ang), c = -Math.cos(this.heading + ang);
+      for (let d = 8; d <= look; d += 4) {
+        const px = this.x + s * d, py = this.y + c * d;
+        if (world.solidAt(px, py)) return d;
+        for (const o of near) { const rr = (o.rad || 6) + 6; if ((o.x - px) ** 2 + (o.y - py) ** 2 < rr * rr) return d; }
+      }
+      return look + 1;
+    };
+    const cC = clearDist(0), cL = clearDist(-0.55), cR = clearDist(0.55);
+    const nearest = Math.min(cC, cL, cR);
+    const blocked = nearest <= look;
+    if (blocked) {
+      const strength = 0.5 + 0.7 * (1 - nearest / look);   // sharper when closer
+      desired = this.heading + (cL >= cR ? -strength : strength);
     }
 
-    // steer the nose toward the target faster than the tyres can follow, so
-    // hard swerves break the back loose into a drift
-    this.heading = lerpAngle(this.heading, desired, Math.min(1, 6 * dt));
+    // steer the nose toward the target (faster when dodging) — hard swerves
+    // break the back loose into a drift
+    this.heading = lerpAngle(this.heading, desired, Math.min(1, (blocked ? 8 : 6) * dt));
 
     // drift model: thrust along the heading, but only bleed sideways velocity
     // slowly (limited grip) — the car slides through turns
@@ -186,7 +199,9 @@ export class AICar {
     const rgt = [Math.cos(this.heading), Math.sin(this.heading)];
     let vf = this.vx * fwd[0] + this.vy * fwd[1];   // forward speed
     let vl = this.vx * rgt[0] + this.vy * rgt[1];   // lateral (slide) speed
-    const top = this.cruise + (dist < 130 ? 55 : 0); // hard lunge to ram when close
+    // lunge to ram only when the way to the player is clear; otherwise ease off
+    let top = this.cruise + (!blocked && dist < 130 ? 55 : 0);
+    if (blocked) top = Math.min(top, this.cruise * (0.4 + 0.5 * (nearest / look)));
     vf = Math.min(top, vf + 200 * dt);
     vf *= Math.exp(-0.3 * dt);
     vl *= Math.exp(-3.0 * dt);                       // grip: how fast the slide scrubs off
