@@ -127,7 +127,7 @@ export class Game {
     const seed = hashStr(this.seedStr);
     this.world = new World(seed, this.isFlatSeed());
     this.particles = new Particles();
-    this.traffic = new Traffic(this.world);
+    this.traffic = new Traffic(this.world, this.mode);
     this.pedestrians = new Pedestrians(this.world);
     this.camera = new Camera();
     const vx = this.world.vA.center(0);

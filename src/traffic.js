@@ -130,6 +130,7 @@ export class AICar {
       // run the normal traffic rules until then.
       this.pursuit = false;
       this.lightT = 0;
+      this.chaseT = 0;   // time spent in active pursuit — feeds desperation
     }
     // every motor vehicle goes up in a fireball (with splash damage) when
     // destroyed; only pedal bikes just crumple
@@ -164,6 +165,12 @@ export class AICar {
   // Ignores lanes/lights entirely — it's trying to wreck you.
   updatePursue(dt, env) {
     const world = env.world, player = env.player;
+    // Desperation: the longer this cruiser has been chasing, the more unhinged
+    // it gets — faster, tighter steering, and less and less willing to steer
+    // around anything it could just smash through. Fully rabid after ~45s.
+    this.chaseT = (this.chaseT || 0) + dt;
+    const desp = Math.min(1, this.chaseT / 45);
+    this.desp = desp;   // light bar flash rate tracks it
     // lead the target (aim where they're going) so the cruiser cuts you off
     // and slams into you instead of trailing behind
     const dist = Math.hypot(player.x - this.x, player.y - this.y) || 1;
@@ -174,19 +181,36 @@ export class AICar {
 
     // obstacle avoidance: cast forward whiskers that detect buildings AND
     // vehicles (parked cars, traffic, other cruisers) and steer around whatever
-    // is in the way, easing off the throttle as it closes in
-    const look = 20 + this.speed * 0.4;
-    const near = [];
+    // is in the way, easing off the throttle as it closes in. Moving vehicles
+    // are checked at where they'll BE when the cruiser reaches each whisker
+    // point, so it threads through traffic instead of dodging stale positions.
+    // A desperate cop stops looking as far ahead (corner-cutting)...
+    const look = (24 + this.speed * 0.5) * (1 - 0.3 * desp);
+    const near = [], nearV = [], nearR = [];
     for (const o of env.obstacles) {
       if (o === this || o === player || o.exploded) continue;
-      if ((o.x - this.x) ** 2 + (o.y - this.y) ** 2 < (look + 24) * (look + 24)) near.push(o);
+      if ((o.x - this.x) ** 2 + (o.y - this.y) ** 2 < (look + 32) * (look + 32)) {
+        near.push(o);
+        nearV.push(o.velocity ? o.velocity() : [o.vx || 0, o.vy || 0]);
+        // ...and light vehicles fade out of its whiskers entirely: at full
+        // desperation it plows straight through cars and bikes, only still
+        // swerving for buildings and the big rigs that would stop it dead.
+        const rr = (o.rad || 6) + 7;
+        nearR.push((o.mass || 1) > 2 ? rr : rr * (1 - 0.85 * desp));
+      }
     }
+    const spd = Math.max(20, this.speed);
     const clearDist = (ang) => {
       const s = Math.sin(this.heading + ang), c = -Math.cos(this.heading + ang);
       for (let d = 8; d <= look; d += 4) {
         const px = this.x + s * d, py = this.y + c * d;
         if (world.solidAt(px, py)) return d;
-        for (const o of near) { const rr = (o.rad || 6) + 6; if ((o.x - px) ** 2 + (o.y - py) ** 2 < rr * rr) return d; }
+        const t = d / spd;   // seconds until the cruiser is here
+        for (let i = 0; i < near.length; i++) {
+          const o = near[i], ox = o.x + nearV[i][0] * t, oy = o.y + nearV[i][1] * t;
+          const rr = nearR[i];
+          if ((ox - px) ** 2 + (oy - py) ** 2 < rr * rr) return d;
+        }
       }
       return look + 1;
     };
@@ -198,9 +222,9 @@ export class AICar {
       desired = this.heading + (cL >= cR ? -strength : strength);
     }
 
-    // steer the nose toward the target (faster when dodging) — hard swerves
-    // break the back loose into a drift
-    this.heading = lerpAngle(this.heading, desired, Math.min(1, (blocked ? 8 : 6) * dt));
+    // steer the nose toward the target (faster when dodging, twitchier when
+    // desperate) — hard swerves break the back loose into a drift
+    this.heading = lerpAngle(this.heading, desired, Math.min(1, (blocked ? 8 + 2 * desp : 6 + 2 * desp) * dt));
 
     // drift model: thrust along the heading, but only bleed sideways velocity
     // slowly (limited grip) — the car slides through turns
@@ -208,15 +232,23 @@ export class AICar {
     const rgt = [Math.cos(this.heading), Math.sin(this.heading)];
     let vf = this.vx * fwd[0] + this.vy * fwd[1];   // forward speed
     let vl = this.vx * rgt[0] + this.vy * rgt[1];   // lateral (slide) speed
-    // lunge to ram only when the way to the player is clear; otherwise ease off
-    let top = this.cruise + (!blocked && dist < 130 ? 55 : 0);
-    if (blocked) top = Math.min(top, this.cruise * (0.4 + 0.5 * (nearest / look)));
+    // lunge to ram only when the way to the player is clear; otherwise ease
+    // off — though a desperate cop runs hotter and barely lifts for anything
+    let top = this.cruise + desp * 20 + (!blocked && dist < 130 + 90 * desp ? 55 : 0);
+    if (blocked) top = Math.min(top, this.cruise * Math.min(1, 0.4 + 0.5 * (nearest / look) + 0.55 * desp));
     vf = Math.min(top, vf + 200 * dt);
     vf *= Math.exp(-0.3 * dt);
     vl *= Math.exp(-3.0 * dt);                       // grip: how fast the slide scrubs off
     this.vx = fwd[0] * vf + rgt[0] * vl;
     this.vy = fwd[1] * vf + rgt[1] * vl;
     this.x += this.vx * dt; this.y += this.vy * dt;
+    // soft ground bogs the cruiser just like it bogs the player — grass slows
+    // it down, and a lake is a genuine trap for an over-eager cop
+    const sdrag = world.surfaceDrag(this.x, this.y);
+    if (sdrag > 1.05) {
+      const f2 = Math.exp(-(sdrag - 1) * 1.1 * dt);
+      this.vx *= f2; this.vy *= f2;
+    }
     this.speed = Math.hypot(this.vx, this.vy);
 
     // hard resolve + damage if we plow into a building
@@ -330,7 +362,7 @@ export class AICar {
     // obstacle probe (cars + player ahead)
     const probe = 16 + this.speed * 0.6;
     const pax = this.x + dv[0] * probe, pay = this.y + dv[1] * probe;
-    let blocked = false;
+    let blocked = false, copAhead = false;
     for (const o of env.obstacles) {
       if (o === this) continue;
       const ddx = o.x - pax, ddy = o.y - pay;
@@ -339,10 +371,14 @@ export class AICar {
         ts = Math.min(ts, Math.max(0, (dd - 22) * 1.6));
       }
       const cdx = o.x - this.x, cdy = o.y - this.y;
-      if (cdx * dv[0] + cdy * dv[1] > 0 && cdx * cdx + cdy * cdy < 24 * 24) { ts = Math.min(ts, 6); blocked = true; }
+      if (cdx * dv[0] + cdy * dv[1] > 0 && cdx * cdx + cdy * cdy < 24 * 24) {
+        ts = Math.min(ts, 6); blocked = true;
+        if (o.police) copAhead = true;
+      }
     }
     // lay on the horn when something's stopped in front of you (city ambiance)
-    if (blocked && this.honkT <= 0 && env.sound) {
+    // — but cops have sirens, not horns, and nobody honks at a cop
+    if (blocked && !copAhead && !this.police && this.honkT <= 0 && env.sound) {
       const dp = Math.hypot(this.x - env.player.x, this.y - env.player.y);
       if (dp < 320 && Math.random() < 0.5) { env.sound.honk(this.x, this.y); this.honkT = 1.6 + Math.random() * 2.6; }
     }
@@ -694,7 +730,9 @@ export class AICar {
     ctx.fillRect(-3, -1, 6, 2);           // housing
     let red = '#5a1414', blue = '#141c5a';
     if (this.pursuit) {
-      const phase = Math.floor(this.lightT * 8) % 2;
+      // flashes quicken as the chase drags on — you can read a cop's
+      // desperation off its roof
+      const phase = Math.floor(this.lightT * (8 + 10 * (this.desp || 0))) % 2;
       red = phase ? '#ff2a2a' : '#4a0000';
       blue = phase ? '#0a0a3a' : '#3a7bff';
     }
@@ -790,8 +828,10 @@ export class AICar {
 }
 
 export class Traffic {
-  constructor(world) {
+  constructor(world, mode) {
     this.world = world;
+    // Free Drive is a cop-free sandbox: no cruisers in traffic, no pursuits.
+    this.cops = mode !== 'cruise';
     this.cars = [];
     this.parkedChunks = new Set();
     this.spawnT = 0;
@@ -826,6 +866,7 @@ export class Traffic {
 
   // Heat: one pursuit cruiser per 10 infractions, each arriving from off-screen.
   updatePursuit(dt, env) {
+    if (!this.cops) return;
     this.pursuitT -= dt;
     // once a cruiser blows up it's gone for good — tally destroyed cops so the
     // dispatch target permanently drops and we never send a replacement
@@ -925,7 +966,8 @@ export class Traffic {
       const dist = 260 + Math.random() * 180;
       const side = Math.random() < 0.5 ? 1 : -1;
       const posAlong = along + side * dist;
-      const kind = pickType(Math.random());
+      let kind = pickType(Math.random());
+      if (kind === 'police' && !this.cops) kind = 'car';
       const bike = kind === 'bike';
       const li = bike ? 0 : Math.floor(Math.random() * axisA.lanes(k)); // pick a lane
       const perp = useV ? -dir : dir;

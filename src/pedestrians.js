@@ -6,7 +6,7 @@
 // The player can mow them down: a hit sprays blood, stains the ground, and
 // (in Rap Sheet mode) counts as an infraction.
 
-import { SIDEWALK } from './world.js';
+import { SIDEWALK, lakeShore } from './world.js';
 
 // Sidewalk centreline offset from a road centre = half(k)+SIDEWALK/2, which
 // lands inside that road's crosswalk band. Scales with the road's width, so
@@ -19,8 +19,25 @@ const HIT_R = 8;
 
 const SHIRTS = ['#c94f4f', '#4f7ec9', '#4faf5a', '#c9a63a', '#9a5fc9', '#3ab0b0', '#d07fb0', '#d8d8d8'];
 const SKIN = ['#caa07a', '#a5744c', '#e3b98f', '#8a5a34'];
+const TOWELS = ['#d84f4f', '#4f7ed8', '#e8c33a', '#3ab0a0', '#d07fb0', '#efe9dc'];
+const SWIM = ['#e05545', '#3f78d2', '#e8c33a', '#39d353', '#d07fb0', '#ff8c42', '#9a5fc9'];
 
 let uid = 1;
+
+// Shared gore: getting run over works the same on a sidewalk or a beach.
+function splatter(p, vx, vy, env) {
+  p.dead = true;
+  p.vx = vx; p.vy = vy;
+  p.stopT = 0.7;
+  env.particles.debris(p.x, p.y, '#8a1414', 6, 95);
+  env.particles.debris(p.x, p.y, p.shirt, 4, 70);
+  env.world.decal(p.x, p.y, (g) => {
+    g.fillStyle = 'rgba(120,16,16,0.5)';
+    g.fillRect(-2, -2, 4, 4);
+    g.fillStyle = 'rgba(120,16,16,0.28)';
+    g.fillRect(-4, -1, 8, 2); g.fillRect(-1, -4, 2, 8);
+  });
+}
 
 class Ped {
   // Walks along road `k` of the given axis, on `side` (+1/-1), heading `dir`.
@@ -99,19 +116,7 @@ class Ped {
     this.syncXY();
   }
 
-  kill(vx, vy, env) {
-    this.dead = true;
-    this.vx = vx; this.vy = vy;
-    this.stopT = 0.7;
-    env.particles.debris(this.x, this.y, '#8a1414', 6, 95);
-    env.particles.debris(this.x, this.y, this.shirt, 4, 70);
-    env.world.decal(this.x, this.y, (g) => {
-      g.fillStyle = 'rgba(120,16,16,0.5)';
-      g.fillRect(-2, -2, 4, 4);
-      g.fillStyle = 'rgba(120,16,16,0.28)';
-      g.fillRect(-4, -1, 8, 2); g.fillRect(-1, -4, 2, 8);
-    });
-  }
+  kill(vx, vy, env) { splatter(this, vx, vy, env); }
 
   draw(ctx, camX, camY) {
     const x = Math.round(this.x - camX), y = Math.round(this.y - camY);
@@ -137,11 +142,113 @@ class Ped {
   }
 }
 
+// Beachgoers around a lake: loungers lie on towels soaking up the sun;
+// players romp between spots straddling the waterline, splashing in the
+// shallows. They share the pedestrian roster (and can be run over the same
+// way) but never leave their lake.
+class BeachPed {
+  constructor(lk) {
+    this.id = uid++;
+    this.lk = lk;
+    this.beach = true;
+    this.dead = false;
+    this.vx = 0; this.vy = 0; this.stopT = 0;
+    this.shirt = SWIM[Math.floor(Math.random() * SWIM.length)];
+    this.skin = SKIN[Math.floor(Math.random() * SKIN.length)];
+    this.towel = TOWELS[Math.floor(Math.random() * TOWELS.length)];
+    this.lounging = Math.random() < 0.55;
+    this.speed = 8 + Math.random() * 10;
+    this.step = Math.random() * 4;
+    this.pauseT = 0;
+    const a = Math.random() * Math.PI * 2;
+    // loungers settle on the sand; players start near the waterline
+    const u = this.lounging ? 1.06 + Math.random() * (lk.beach * 0.8)
+                            : 0.92 + Math.random() * 0.24;
+    [this.x, this.y] = this.spot(a, u);
+    this.tx = this.x; this.ty = this.y;
+  }
+
+  // world point at shore-angle a and normalized shore distance u (1 = waterline)
+  spot(a, u) {
+    const w = lakeShore(this.lk, a);
+    return [this.lk.cx + Math.cos(a) * this.lk.rx * u * w,
+            this.lk.cy + Math.sin(a) * this.lk.ry * u * w];
+  }
+
+  // normalized shore distance of the current position (<1 = in the water)
+  shoreU() {
+    const dx = this.x - this.lk.cx, dy = this.y - this.lk.cy;
+    return Math.hypot(dx / this.lk.rx, dy / this.lk.ry) / lakeShore(this.lk, Math.atan2(dy, dx));
+  }
+
+  update(dt, env) {
+    if (this.dead) {
+      this.x += this.vx * dt; this.y += this.vy * dt;
+      this.vx *= Math.exp(-4 * dt); this.vy *= Math.exp(-4 * dt);
+      this.stopT -= dt;
+      return;
+    }
+    this.step += this.speed * dt * 0.35;
+    if (this.lounging) return;                       // soaking up the sun
+    if (this.pauseT > 0) { this.pauseT -= dt; return; }
+    const dx = this.tx - this.x, dy = this.ty - this.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 2) {
+      // pick the next romp spot a little way along the shore
+      const a = Math.atan2(this.y - this.lk.cy, this.x - this.lk.cx) + (Math.random() - 0.5) * 1.4;
+      [this.tx, this.ty] = this.spot(a, 0.90 + Math.random() * 0.3);
+      if (Math.random() < 0.4) this.pauseT = 0.3 + Math.random() * 1.2;
+    } else {
+      const inWater = this.shoreU() < 1;
+      const sp = this.speed * (inWater ? 0.55 : 1);  // wading is slow
+      this.x += (dx / d) * sp * dt;
+      this.y += (dy / d) * sp * dt;
+      if (inWater && Math.random() < dt * 1.5) env.particles.water(this.x, this.y);
+    }
+  }
+
+  kill(vx, vy, env) { splatter(this, vx, vy, env); }
+
+  draw(ctx, camX, camY) {
+    const x = Math.round(this.x - camX), y = Math.round(this.y - camY);
+    if (this.dead) {
+      ctx.fillStyle = 'rgba(120,16,16,0.45)';
+      ctx.fillRect(x - 3, y - 1, 7, 3);
+      ctx.fillStyle = this.shirt;
+      ctx.fillRect(x - 2, y - 1, 4, 2);
+      ctx.fillStyle = this.skin;
+      ctx.fillRect(x + 2, y - 1, 1, 1);
+      return;
+    }
+    if (this.lounging) {
+      ctx.fillStyle = this.towel;
+      ctx.fillRect(x - 3, y - 2, 6, 4);
+      ctx.fillStyle = this.shirt;         // sunbather stretched along the towel
+      ctx.fillRect(x - 2, y - 1, 3, 2);
+      ctx.fillStyle = this.skin;
+      ctx.fillRect(x + 1, y - 1, 1, 1);
+      return;
+    }
+    // splashing about: the standard walker with an exaggerated hop
+    const bob = Math.floor(this.step) & 1;
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.fillRect(x - 1, y + 2, 3, 1);
+    ctx.fillStyle = '#2c2c34';
+    ctx.fillRect(x - 1 + bob, y + 1, 1, 1);
+    ctx.fillRect(x + 1 - bob, y + 1, 1, 1);
+    ctx.fillStyle = this.shirt;
+    ctx.fillRect(x - 1, y - 1 - bob, 2, 2);
+    ctx.fillStyle = this.skin;
+    ctx.fillRect(x - 1, y - 3 - bob, 2, 1);
+  }
+}
+
 export class Pedestrians {
   constructor(world) {
     this.world = world;
     this.peds = [];
     this.spawnT = 0;
+    this.beachKeys = new Set();   // lake blocks whose crowd is already placed
   }
 
   update(dt, env) {
@@ -149,15 +256,47 @@ export class Pedestrians {
     this.spawnT -= dt;
     if (!this.world.flat && this.spawnT <= 0) {
       this.spawnT = 0.5;
-      const alive = this.peds.reduce((n, p) => n + (p.dead ? 0 : 1), 0);
+      this.syncBeaches(player);
+      // beach crowds don't count against the sidewalk-stroller budget
+      const alive = this.peds.reduce((n, p) => n + (p.dead || p.beach ? 0 : 1), 0);
       if (alive < TARGET) this.trySpawn(player);
       for (let i = this.peds.length - 1; i >= 0; i--) {
         const p = this.peds[i];
-        if (Math.hypot(p.x - player.x, p.y - player.y) > DESPAWN_R) this.peds.splice(i, 1);
+        // beach peds live longer so a lakeshore doesn't empty out mid-visit
+        const r = p.beach ? 700 : DESPAWN_R;
+        if (Math.hypot(p.x - player.x, p.y - player.y) > r) this.peds.splice(i, 1);
       }
     }
     for (const p of this.peds) p.update(dt, env);
     this.collide(env);
+  }
+
+  // Drop a crowd on each lake beach as the player approaches. One batch per
+  // lake; the claim is released once the player is far enough away that the
+  // whole crowd has despawned, so a return visit finds the beach busy again.
+  syncBeaches(player) {
+    const world = this.world;
+    const iA = world.vA.locate(player.x - 450), iB = world.vA.locate(player.x + 450);
+    const jA = world.hA.locate(player.y - 450), jB = world.hA.locate(player.y + 450);
+    for (let i = iA; i <= iB; i++) {
+      for (let j = jA; j <= jB; j++) {
+        const L = world.block(i, j);
+        if (L.type !== 'lake') continue;
+        const key = i + ',' + j;
+        if (this.beachKeys.has(key)) continue;
+        const lk = L.lake;
+        if (Math.hypot(lk.cx - player.x, lk.cy - player.y) > 620) continue;
+        this.beachKeys.add(key);
+        const n = 5 + Math.floor(Math.random() * 5);
+        for (let m = 0; m < n; m++) this.peds.push(new BeachPed(lk));
+      }
+    }
+    for (const key of [...this.beachKeys]) {
+      const [i, j] = key.split(',').map(Number);
+      const cx = (world.vA.center(i) + world.vA.center(i + 1)) / 2;
+      const cy = (world.hA.center(j) + world.hA.center(j + 1)) / 2;
+      if (Math.hypot(cx - player.x, cy - player.y) > 900) this.beachKeys.delete(key);
+    }
   }
 
   trySpawn(player) {

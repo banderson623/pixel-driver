@@ -50,6 +50,8 @@ const T = {
   PLINE: C('#bfbfc7'), CROSS: C('#cfcfd7'),
   PLAZA: C('#9a9181'), PLAZA2: C('#a59b89'),
   ALLEY: C('#5c5c64'), ALLEY2: C('#63636b'),
+  WATER: C('#2e5a86'), WATER2: C('#376a99'), WATERS: C('#4f88ad'),
+  SAND: C('#d9c78b'), SAND2: C('#cbb779'),
 };
 export { T };
 
@@ -64,9 +66,27 @@ const SCHEME_DEFS = [
   ['#6f5566', '#795d70', '#94748a', '#54404d'], // mauve
   ['#8a5a30', '#946336', '#b07f4a', '#684423'], // rust
 ];
-const SCHEMES = SCHEME_DEFS.map(d => ({ roof: C(d[0]), roof2: C(d[1]), edge: C(d[2]), det: C(d[3]) }));
+// Setback upper storeys get progressively paler roofs (plus a longer baked
+// shadow), which is what makes a stepped tower read as tall from above.
+function shade(css, f) {
+  const n = parseInt(css.slice(1), 16);
+  const ch = (v) => Math.min(255, Math.round(v * f));
+  return '#' + ((ch((n >> 16) & 255) << 16) | (ch((n >> 8) & 255) << 8) | ch(n & 255)).toString(16).padStart(6, '0');
+}
+const SCHEMES = SCHEME_DEFS.map(d => ({
+  roof: C(d[0]), roof2: C(d[1]), edge: C(d[2]), det: C(d[3]),
+  up1: C(shade(d[0], 1.16)), up1b: C(shade(d[1], 1.16)),
+  up2: C(shade(d[0], 1.34)), up2b: C(shade(d[1], 1.34)),
+}));
 
 export function isSolidIdx(idx) { return idx >= SOLID_START; }
+
+// Lake shoreline wobble: multiplier on the water ellipse's radius at angle a.
+// Shared by terrain classification and the beach crowd so both agree exactly
+// on where the waterline sits.
+export function lakeShore(lk, a) {
+  return 1 + 0.14 * Math.sin(2 * a + lk.p1) + 0.09 * Math.sin(5 * a + lk.p2);
+}
 
 // -------------------------------------------------------------- prop sprites
 function makeSprite(w, h, fn) {
@@ -362,7 +382,9 @@ export class World {
     let type = 'bldg';
     if (roll >= 0.62 && roll < 0.76) type = 'park';
     else if (roll >= 0.76 && roll < 0.90) type = 'lot';
-    else if (roll >= 0.90) type = 'plaza';
+    else if (roll >= 0.90 && roll < 0.955) type = 'plaza';
+    else if (roll >= 0.955) type = 'lake';
+    if (type === 'lake' && (w < 150 || h < 150)) type = 'park'; // needs room for water + beach
     L = { x0, y0, x1, y1, type, rects: [], props: [], cars: [] };
 
     const prop = (t, x, y) => {
@@ -384,12 +406,64 @@ export class World {
             if (R() < 0.7) prop(R() < 0.5 ? 'tree0' : 'tree1', lx0 + lw / 2, ly0 + lh / 2);
             continue;
           }
+          if (r < 0.24) {
+            // small private parking lot tucked in beside the buildings: an
+            // asphalt pad with stall lines and a scatter of parked cars
+            const px0 = lx0 + 3, py0 = ly0 + 3, px1 = lx0 + lw - 3, py1 = ly0 + lh - 3;
+            L.rects.push({ x0: px0, y0: py0, x1: px1, y1: py1, kind: 'a' });
+            for (let rowY = py0 + 6; rowY + 26 < py1; rowY += 44) {
+              for (let sx = px0 + 5; sx + 15 < px1 - 5; sx += 15) {
+                L.rects.push({ x0: sx, y0: rowY, x1: sx + 1.5, y1: rowY + 24, kind: 'l' });
+                if (R() < 0.55) {
+                  L.cars.push({ x: sx + 8, y: rowY + 12, ang: (R() < 0.5 ? 0 : Math.PI) + (R() - 0.5) * 0.08 });
+                }
+              }
+            }
+            continue;
+          }
           const in0 = 2 + R() * 5, in1 = 2 + R() * 5, in2 = 2 + R() * 5, in3 = 2 + R() * 5;
           const bx0 = lx0 + in0, by0 = ly0 + in1;
           const bx1 = Math.max(bx0 + 20, lx0 + lw - in2), by1 = Math.max(by0 + 20, ly0 + lh - in3);
           const s = Math.floor(R() * SCHEMES.length);
           const bh = 1 + Math.floor(R() * 4); // height tier 1..4 -> shadow length
           L.rects.push({ x0: bx0, y0: by0, x1: bx1, y1: by1, kind: 'b', s, h: bh });
+          // massing variants layered over the base slab
+          const style = R();
+          if (style < 0.30) {
+            // stepped tower: setback upper storeys, each taller and paler
+            let tx0 = bx0, ty0 = by0, tx1 = bx1, ty1 = by1, th = bh;
+            const tiers = 1 + (R() < 0.45 ? 1 : 0);
+            for (let t = 1; t <= tiers; t++) {
+              // setbacks scale with the footprint so a big slab steps in
+              // decisively instead of leaving a thin border
+              const wA = tx1 - tx0, hA = ty1 - ty0;
+              tx0 += wA * (0.10 + R() * 0.12); tx1 -= wA * (0.10 + R() * 0.12);
+              ty0 += hA * (0.10 + R() * 0.12); ty1 -= hA * (0.10 + R() * 0.12);
+              if (tx1 - tx0 < 14 || ty1 - ty0 < 14) break;
+              th += 1 + Math.floor(R() * 2);
+              L.rects.push({ x0: tx0, y0: ty0, x1: tx1, y1: ty1, kind: 'b', s, h: th, t: Math.min(2, t) });
+            }
+          } else if (style < 0.42 && bx1 - bx0 > 46 && by1 - by0 > 46) {
+            // courtyard building: hollow centre with a garden in it
+            const mx = 10 + R() * 6, my = 10 + R() * 6;
+            L.rects.push({ x0: bx0 + mx, y0: by0 + my, x1: bx1 - mx, y1: by1 - my, kind: 'g' });
+            if (R() < 0.7) prop(R() < 0.5 ? 'tree1' : 'planter', (bx0 + bx1) / 2, (by0 + by1) / 2);
+          } else if (style < 0.58 && bx1 - bx0 > 40 && by1 - by0 > 40) {
+            // split mass: a taller slab flush along one side of the lower base
+            const th = bh + 1 + Math.floor(R() * 3);
+            const frac = 0.4 + R() * 0.25;
+            let wing;
+            if (R() < 0.5) {
+              const ww = (bx1 - bx0) * frac;
+              wing = R() < 0.5 ? { x0: bx0, y0: by0, x1: bx0 + ww, y1: by1 }
+                               : { x0: bx1 - ww, y0: by0, x1: bx1, y1: by1 };
+            } else {
+              const wh = (by1 - by0) * frac;
+              wing = R() < 0.5 ? { x0: bx0, y0: by0, x1: bx1, y1: by0 + wh }
+                               : { x0: bx0, y0: by1 - wh, x1: bx1, y1: by1 };
+            }
+            L.rects.push(Object.assign(wing, { kind: 'b', s, h: th, t: 1 }));
+          }
           const m = 1 + Math.floor(R() * 3);
           for (let d = 0; d < m; d++) {
             const dw = 5 + R() * 6, dh = 5 + R() * 6;
@@ -433,7 +507,7 @@ export class World {
           }
         }
       }
-    } else { // plaza
+    } else if (type === 'plaza') {
       const np = 2 + Math.floor(R() * 3);
       for (let p = 0; p < np; p++) {
         const pw = 10 + R() * 10, phh = 10 + R() * 10;
@@ -443,6 +517,27 @@ export class World {
       }
       for (let b = 0; b < 3; b++) {
         if (R() < 0.6) prop('bench', x0 + 8 + R() * (w - 16), y0 + 8 + R() * (h - 16));
+      }
+    } else { // lake: a wobbly-shored pond, a sandy beach ring, grass beyond
+      const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+      const beach = 0.26 + R() * 0.16;         // beach width, in shore units
+      const fit = 1.23 * (1 + beach) + 0.08;   // max shoreline wobble × beach reach
+      L.lake = {
+        cx, cy,
+        rx: Math.max(22, w / 2 / fit - 3),
+        ry: Math.max(22, h / 2 / fit - 3),
+        p1: R() * Math.PI * 2, p2: R() * Math.PI * 2,
+        beach,
+      };
+      // trees and benches on the grass ring, facing the water
+      for (let n2 = 0; n2 < 7; n2++) {
+        const a = R() * Math.PI * 2;
+        const u = (1 + beach + 0.12) * lakeShore(L.lake, a);
+        const px = cx + Math.cos(a) * L.lake.rx * u, py = cy + Math.sin(a) * L.lake.ry * u;
+        if (px < x0 + 8 || px > x1 - 8 || py < y0 + 8 || py > y1 - 8) continue;
+        const r2 = R();
+        if (r2 < 0.45) prop(r2 < 0.25 ? 'tree0' : 'tree1', px, py);
+        else if (r2 < 0.75) prop('bench', px, py);
       }
     }
 
@@ -553,12 +648,15 @@ export class World {
           case 'b': {
             const sc = SCHEMES[q.s];
             if (wx < q.x0 + 2 || wx >= q.x1 - 2 || wy < q.y0 + 2 || wy >= q.y1 - 2) return sc.edge;
+            if (q.t === 2) return nz < 0.15 ? sc.up2b : sc.up2;
+            if (q.t === 1) return nz < 0.15 ? sc.up1b : sc.up1;
             return nz < 0.15 ? sc.roof2 : sc.roof;
           }
           case 'd': return SCHEMES[q.s].det;
           case 'g': return nz < 0.3 ? T.GRASS2 : T.GRASS;
           case 'p': return T.DIRT;
           case 'l': return T.PLINE;
+          case 'a': return nz < 0.12 ? T.ASPH2 : T.ASPH;
         }
       }
     }
@@ -566,6 +664,17 @@ export class World {
       case 'park': return nz < 0.3 ? T.GRASS2 : T.GRASS;
       case 'lot': return nz < 0.12 ? T.ASPH2 : T.ASPH;
       case 'plaza': return nz < 0.25 ? T.PLAZA2 : T.PLAZA;
+      case 'lake': {
+        const lk = L.lake;
+        const ldx = wx - lk.cx, ldy = wy - lk.cy;
+        const u = Math.hypot(ldx / lk.rx, ldy / lk.ry) / lakeShore(lk, Math.atan2(ldy, ldx));
+        if (u < 1) {
+          if (u > 0.92) return T.WATERS;      // pale shallows lapping the sand
+          return nz < 0.10 ? T.WATER2 : T.WATER;
+        }
+        if (u < 1 + lk.beach) return nz < 0.22 ? T.SAND2 : T.SAND;
+        return nz < 0.3 ? T.GRASS2 : T.GRASS;
+      }
       default: return nz < 0.2 ? T.ALLEY2 : T.ALLEY;
     }
   }
@@ -770,6 +879,8 @@ export class World {
 
   surfaceDrag(wx, wy) {
     const c = this.cellAt(wx, wy);
+    if (c === T.WATER || c === T.WATER2 || c === T.WATERS) return 3.4;
+    if (c === T.SAND || c === T.SAND2) return 1.9;
     if (c === T.GRASS || c === T.GRASS2) return 2.1;
     if (c === T.DIRT) return 1.8;
     if (c === T.RUB || c === T.RUB2) return 1.6;
