@@ -39,6 +39,13 @@ rebuilds the exact same city, forever, in every direction.
 - **Endless seeded city** — an irregular road grid generated chunk-by-chunk
   from a hash of the seed: buildings, parks, plazas, parking lots full of
   cars, traffic lights, lamps, hydrants, benches, cones, trees.
+- **Varied road types** — the plain street grid is joined by wide multi-lane
+  **highways** (painted median, faster traffic, no cross-lights), **bendy
+  roads** that hold a straight line then make a smooth 90°-style corner to a
+  parallel line (no continuous snaking), and **roundabouts** where traffic
+  circulates a planted island and peels off at its exit. All three regenerate
+  from the seed via knobs at the top of `world.js` (rank rates, bend
+  amplitude/spacing, roundabout frequency).
 - **Destructible everything** — the world is a grid of 2px cells; buildings
   chip into rubble when you hit them. Every car is a grid of individual
   pixels that dent and tear off per-impact. Skid marks and scorch decals are

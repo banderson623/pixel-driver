@@ -7,6 +7,7 @@ export class Sound {
   constructor() {
     this.ctx = null;
     this.muted = false;
+    this.suppressed = false;    // hard-silence everything (e.g. after you die)
     this.lx = 0; this.ly = 0;   // listener (player) world position
   }
 
@@ -102,26 +103,27 @@ export class Sound {
     const f = 42 + rpm * 140;
     this.engOsc.frequency.setTargetAtTime(f, t, 0.05);
     this.engSub.frequency.setTargetAtTime(f / 2, t, 0.05);
-    const g = (this.muted || !on) ? 0 : 0.035 + rpm * 0.075;
+    const g = (this.muted || this.suppressed || !on) ? 0 : 0.035 + rpm * 0.075;
     this.engGain.gain.setTargetAtTime(g, t, 0.08);
   }
 
   setSkid(level) {
     if (!this.ctx) return;
     const t = this.ctx.currentTime, l = Math.min(1, level);
-    this.skidGain.gain.setTargetAtTime(this.muted ? 0 : l * 0.13, t, 0.05);
+    const off = this.muted || this.suppressed;
+    this.skidGain.gain.setTargetAtTime(off ? 0 : l * 0.13, t, 0.05);
     // the squeal only bites hard in a big slide
-    this.squealGain.gain.setTargetAtTime(this.muted ? 0 : l * l * 0.11, t, 0.05);
+    this.squealGain.gain.setTargetAtTime(off ? 0 : l * l * 0.11, t, 0.05);
   }
 
   setSiren(level) {
     if (!this.ctx) return;
-    const g = this.muted ? 0 : Math.min(1, level) * 0.07;
+    const g = (this.muted || this.suppressed) ? 0 : Math.min(1, level) * 0.07;
     this.sirenGain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.12);
   }
 
   burst(dur, freq, gain, type = 'bandpass') {
-    if (!this.ctx || this.muted || gain <= 0.0006) return;
+    if (!this.ctx || this.muted || this.suppressed || gain <= 0.0006) return;
     const ctx = this.ctx, t = ctx.currentTime;
     const src = ctx.createBufferSource();
     src.buffer = this.noiseBuf;
@@ -138,7 +140,7 @@ export class Sound {
   }
 
   crash(mag, x, y) {
-    if (!this.ctx || this.muted) return;
+    if (!this.ctx || this.muted || this.suppressed) return;
     const a = this.atten(x, y);
     if (a <= 0) return;
     mag = Math.min(1, mag);
@@ -162,7 +164,7 @@ export class Sound {
 
   // two-tone car horn
   honk(x, y) {
-    if (!this.ctx || this.muted) return;
+    if (!this.ctx || this.muted || this.suppressed) return;
     const a = this.atten(x, y);
     if (a <= 0) return;
     const ctx = this.ctx, t = ctx.currentTime, dur = 0.3 + Math.random() * 0.25;
