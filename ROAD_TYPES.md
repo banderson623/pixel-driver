@@ -9,6 +9,17 @@ Branch: `road-types`. Goal: add **highways**, **curvier roads**, and
 > circulating, and exiting roundabouts with no cars ever stuck and no runtime
 > errors. This doc is kept as the rationale/architecture record.
 
+## Screenshots
+
+| Highways | Bendy roads | Roundabouts |
+|---|---|---|
+| ![highway](docs/roads/highway.png) | ![bendy road](docs/roads/bendy-road.png) | ![roundabout](docs/roads/roundabout.png) |
+
+Highway: wide asphalt, solid double-yellow median, dashed lane dividers (two
+lanes each way). Bendy road: holds a straight line, makes one smooth corner to
+a parallel line, then straightens (no continuous snaking). Roundabout: asphalt
+ring with a dashed circulating lane around a planted island.
+
 ## The one constraint that shapes everything
 
 The city is an **axis-aligned grid used as a navigation graph**, not just as
