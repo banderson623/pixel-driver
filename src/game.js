@@ -22,14 +22,14 @@ const MODES = ['cruise', 'rapsheet'];
 const MODE_NAMES = { cruise: 'FREE DRIVE', rapsheet: 'RAP SHEET' };
 
 function newInfractions() {
-  return { speeding: 0, offroad: 0, wrongWay: 0, redLight: 0, wreck: 0, pedestrian: 0 };
+  return { speeding: 0, offroad: 0, wrongWay: 0, redLight: 0, wreck: 0, blownUp: 0, pedestrian: 0 };
 }
 function infractionTotal(inf) {
-  return inf.speeding + inf.offroad + inf.wrongWay + inf.redLight + inf.wreck + inf.pedestrian;
+  return inf.speeding + inf.offroad + inf.wrongWay + inf.redLight + inf.wreck + inf.blownUp + inf.pedestrian;
 }
 // Penalty points per infraction — speeding is minor, killing a pedestrian is
 // the worst thing you can do. The severity score weights the raw count by these.
-const WEIGHTS = { speeding: 1, offroad: 2, wrongWay: 3, redLight: 5, wreck: 8, pedestrian: 20 };
+const WEIGHTS = { speeding: 1, offroad: 2, wrongWay: 3, redLight: 5, wreck: 8, blownUp: 12, pedestrian: 20 };
 function infractionScore(inf) {
   let s = 0;
   for (const k in WEIGHTS) s += inf[k] * WEIGHTS[k];
@@ -429,17 +429,20 @@ export class Game {
     const info = `SEED ${this.seedStr}  ${s.dist.toFixed(2)} MI`;
     drawText(ctx, info, W - textWidth(info, 1) - 6, 9, 1, 'rgba(255,255,255,0.55)');
 
-    // rap-sheet infraction tally (top center)
+    // rap-sheet penalty points, shown large (top center)
     if (this.mode === 'rapsheet') {
-      const total = infractionTotal(s.infractions);
+      const pts = infractionScore(s.infractions);
       const flash = s.t - s.lastInfractionT < 0.4;
-      const bx = W / 2 - 50, bw = 100;
-      ctx.fillStyle = 'rgba(0,0,0,0.55)';
-      ctx.fillRect(bx, 6, bw, 20);
-      drawText(ctx, 'INFRACTIONS', bx + 5, 9, 1, flash ? '#ffffff' : '#c8c8d0');
-      const num = String(total);
-      drawText(ctx, num, bx + bw - textWidth(num, 2) - 5, 15, 2, flash ? '#ffffff' : '#e05545');
-      if (flash) { ctx.strokeStyle = '#ffffff'; ctx.strokeRect(bx + 0.5, 6.5, bw - 1, 19); }
+      drawTextCentered(ctx, String(pts), W / 2, 6, 3, flash ? '#ffffff' : '#e05545');
+      drawTextCentered(ctx, 'PTS', W / 2, 24, 1, flash ? '#ffffff' : '#9a9aa4');
+    }
+
+    // cops in pursuit — flashing red/blue like a siren, shown while chased
+    const pursuers = this.traffic ? this.traffic.pursuers() : 0;
+    if (pursuers > 0) {
+      const y = this.mode === 'rapsheet' ? 34 : 8;
+      const phase = Math.floor(s.t * 6) % 2;
+      drawTextCentered(ctx, `${pursuers} IN PURSUIT`, W / 2, y, 1, phase ? '#e05545' : '#3a7bff');
     }
   }
 
@@ -551,10 +554,11 @@ export class Game {
       ['WRONG WAY', 'wrongWay'],
       ['RAN REDS', 'redLight'],
       ['WRECKS', 'wreck'],
+      ['BLEW UP', 'blownUp'],
       ['PEDESTRIANS', 'pedestrian'],
     ];
     rows.forEach(([label, key], i) => {
-      const y = 102 + i * 12;
+      const y = 100 + i * 11;
       const n = inf[key], pts = n * WEIGHTS[key];
       const col = n > 0 ? '#e05545' : '#6a6a74';
       drawText(ctx, label, x0, y, 1, n > 0 ? '#c8c8d0' : '#6a6a74');
@@ -564,13 +568,13 @@ export class Game {
       drawText(ctx, pv, x1 - textWidth(pv, 1), y, 1, col);
     });
     // column captions (small, above the first row)
-    drawText(ctx, 'CT', xCt - textWidth('CT', 1), 96, 1, '#6a6a74');
-    drawText(ctx, 'PTS', x1 - textWidth('PTS', 1), 96, 1, '#6a6a74');
+    drawText(ctx, 'CT', xCt - textWidth('CT', 1), 94, 1, '#6a6a74');
+    drawText(ctx, 'PTS', x1 - textWidth('PTS', 1), 94, 1, '#6a6a74');
     // divider + weighted severity score
     ctx.fillStyle = '#3a3a44';
-    ctx.fillRect(x0, 176, x1 - x0, 1);
-    drawText(ctx, 'SEVERITY', x0, 182, 1, '#ffffff');
+    ctx.fillRect(x0, 179, x1 - x0, 1);
+    drawText(ctx, 'SEVERITY', x0, 185, 1, '#ffffff');
     const sv = String(infractionScore(inf));
-    drawText(ctx, sv, x1 - textWidth(sv, 2), 180, 2, '#ffffff');
+    drawText(ctx, sv, x1 - textWidth(sv, 2), 183, 2, '#ffffff');
   }
 }

@@ -54,6 +54,17 @@ export class Particles {
     }
   }
 
+  // big tumbling debris pieces (e.g. bits of a vehicle blown apart)
+  chunk(x, y, color, size = 3) {
+    const a = Math.random() * Math.PI * 2;
+    const s = 45 + Math.random() * 105;
+    this.spawn({
+      kind: 'debris', x, y,
+      vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      ttl: 0.9 + Math.random() * 1.4, size, color,
+    });
+  }
+
   sparks(x, y, n = 3) {
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;

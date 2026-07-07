@@ -19,17 +19,18 @@ const BIKE_FRAMES = ['#2a2a30', '#39424e', '#4a2f2f', '#2f4a3a'];
 // the big rigs shove the player around; hp sets how much abuse they take.
 const TYPES = {
   car:        { len: 24, wid: 13, cruiseLo: 55, cruiseHi: 90,  mass: 1, hpLo: 55,  hpHi: 85 },
+  police:     { len: 24, wid: 13, cruiseLo: 62, cruiseHi: 96,  mass: 1, hpLo: 190, hpHi: 215 },
   motorcycle: { len: 14, wid: 5,  cruiseLo: 62, cruiseHi: 104, mass: 1, hpLo: 10,  hpHi: 18 },
-  schoolbus:  { len: 46, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 5, hpLo: 150, hpHi: 210 },
-  citybus:    { len: 48, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 5, hpLo: 150, hpHi: 210 },
-  dumptruck:  { len: 34, wid: 15, cruiseLo: 46, cruiseHi: 66,  mass: 5, hpLo: 160, hpHi: 220 },
-  gastruck:   { len: 56, wid: 14, cruiseLo: 42, cruiseHi: 60,  mass: 6, hpLo: 170, hpHi: 230 },
+  schoolbus:  { len: 46, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 8,  hpLo: 150, hpHi: 210 },
+  citybus:    { len: 48, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 8,  hpLo: 150, hpHi: 210 },
+  dumptruck:  { len: 34, wid: 15, cruiseLo: 46, cruiseHi: 66,  mass: 7,  hpLo: 160, hpHi: 220 },
+  gastruck:   { len: 56, wid: 14, cruiseLo: 42, cruiseHi: 60,  mass: 10, hpLo: 170, hpHi: 230 },
   bike:       { len: 11, wid: 4,  cruiseLo: 30, cruiseHi: 46,  mass: 1, hpLo: 1,   hpHi: 4 },
 };
 // spawn probabilities (cumulative); the remainder to 1.0 is plain cars
 const SPAWN_MIX = [
   ['bike', 0.20], ['motorcycle', 0.08], ['schoolbus', 0.06],
-  ['citybus', 0.06], ['dumptruck', 0.06], ['gastruck', 0.05],
+  ['citybus', 0.06], ['dumptruck', 0.06], ['gastruck', 0.05], ['police', 0.05],
 ];
 function pickType(r) {
   let acc = 0;
@@ -84,7 +85,9 @@ export class AICar {
     this.action = 'straight';
     this.turn = null;
     this.parkedOrigin = this.mode === 'parked';
-    const scheme = AI_COLORS[Math.floor(Math.random() * AI_COLORS.length)];
+    const scheme = opts.kind === 'police'
+      ? ['#e3e7ec', '#16161c']                                     // black-and-white cruiser
+      : AI_COLORS[Math.floor(Math.random() * AI_COLORS.length)];
     this.body = new CarBody(scheme[0], scheme[1]);
     this.smokeAcc = 0;
 
@@ -97,18 +100,44 @@ export class AICar {
     this.mass = cfg.mass;
     this.cruise = cfg.cruiseLo + Math.random() * (cfg.cruiseHi - cfg.cruiseLo);
     this.hp = cfg.hpLo + Math.random() * (cfg.hpHi - cfg.hpLo);
+    this.maxHp = this.hp;           // for the little on-screen damage meter
     this.laneOff = this.bike ? BIKE_LANE : LANE;
     if (this.bike || this.type === 'motorcycle') { // has a visible rider
       this.frame = BIKE_FRAMES[Math.floor(Math.random() * BIKE_FRAMES.length)];
       this.shirt = BIKE_SHIRTS[Math.floor(Math.random() * BIKE_SHIRTS.length)];
       this.skin = BIKE_SKIN[Math.floor(Math.random() * BIKE_SKIN.length)];
     }
+    if (this.type === 'gastruck') {   // articulated: cab + hinged tank trailer
+      this.cabLen = 16;               // cab length
+      this.trailerLen = 34;           // tank length, hitch → rear
+      this.hitch = 8;                 // hitch distance behind the cab center
+      this.trailerHeading = this.heading;
+      this.trailerRear = null;        // rear-axle world point (lazily initialised)
+    }
+    if (this.type === 'police') {
+      this.police = true;
+      // Flip `pursuit` on and the roof light bar flashes red/blue; patrol cars
+      // run the normal traffic rules until then.
+      this.pursuit = false;
+      this.lightT = 0;
+    }
+    // every motor vehicle goes up in a fireball (with splash damage) when
+    // destroyed; only pedal bikes just crumple
+    this.canExplode = this.type !== 'bike';
+  }
+
+  // Blast strength when destroyed — scales with the vehicle's weight and
+  // length, so heavier/larger vehicles make bigger fireballs. The fuel tanker
+  // gets an extra multiplier on top: it's huge.
+  explodePower() {
+    const size = 0.5 + (this.mass || 1) * 0.14 + this.half * 0.028;
+    return this.type === 'gastruck' ? size * 1.4 : size;
   }
 
   dirVec() { return this.axis === 'v' ? [0, this.dir] : [this.dir, 0]; }
 
   velocity() {
-    if (this.mode === 'shove') return [this.vx, this.vy];
+    if (this.mode === 'shove' || this.mode === 'pursue') return [this.vx, this.vy];
     if (this.mode === 'drive' || this.mode === 'turn') {
       const f = [Math.sin(this.heading), -Math.cos(this.heading)];
       return [f[0] * this.speed, f[1] * this.speed];
@@ -121,10 +150,78 @@ export class AICar {
     this.action = r < 0.55 ? 'straight' : r < 0.8 ? 'right' : 'left';
   }
 
+  // Pursuit driving: intercept the player and ram, swerving around buildings.
+  // Ignores lanes/lights entirely — it's trying to wreck you.
+  updatePursue(dt, env) {
+    const world = env.world, player = env.player;
+    // lead the target (aim where they're going) so the cruiser cuts you off
+    // and slams into you instead of trailing behind
+    const dist = Math.hypot(player.x - this.x, player.y - this.y) || 1;
+    const lead = Math.min(0.55, dist / 320);
+    const tx = player.x + player.vx * lead, ty = player.y + player.vy * lead;
+    const dx = tx - this.x, dy = ty - this.y;
+    let desired = headingOf(dx, dy);
+
+    // building avoidance: if something solid is dead ahead, steer toward
+    // whichever side has more clearance
+    const look = 16 + this.speed * 0.28;
+    const f = [Math.sin(this.heading), -Math.cos(this.heading)];
+    if (world.solidAt(this.x + f[0] * look, this.y + f[1] * look)) {
+      const clear = (ang) => {
+        const s = Math.sin(this.heading + ang), c = -Math.cos(this.heading + ang);
+        for (let d = 6; d <= look; d += 4) if (world.solidAt(this.x + s * d, this.y + c * d)) return d;
+        return look + 1;
+      };
+      desired = this.heading + (clear(-0.9) >= clear(0.9) ? -0.9 : 0.9);
+    }
+
+    // steer the nose toward the target faster than the tyres can follow, so
+    // hard swerves break the back loose into a drift
+    this.heading = lerpAngle(this.heading, desired, Math.min(1, 6 * dt));
+
+    // drift model: thrust along the heading, but only bleed sideways velocity
+    // slowly (limited grip) — the car slides through turns
+    const fwd = [Math.sin(this.heading), -Math.cos(this.heading)];
+    const rgt = [Math.cos(this.heading), Math.sin(this.heading)];
+    let vf = this.vx * fwd[0] + this.vy * fwd[1];   // forward speed
+    let vl = this.vx * rgt[0] + this.vy * rgt[1];   // lateral (slide) speed
+    const top = this.cruise + (dist < 130 ? 55 : 0); // hard lunge to ram when close
+    vf = Math.min(top, vf + 200 * dt);
+    vf *= Math.exp(-0.3 * dt);
+    vl *= Math.exp(-3.0 * dt);                       // grip: how fast the slide scrubs off
+    this.vx = fwd[0] * vf + rgt[0] * vl;
+    this.vy = fwd[1] * vf + rgt[1] * vl;
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.speed = Math.hypot(this.vx, this.vy);
+
+    // hard resolve + damage if we plow into a building
+    if (world.solidAt(this.x, this.y)) {
+      let nx = (world.solidAt(this.x - 3, this.y) ? 1 : 0) - (world.solidAt(this.x + 3, this.y) ? 1 : 0);
+      let ny = (world.solidAt(this.x, this.y - 3) ? 1 : 0) - (world.solidAt(this.x, this.y + 3) ? 1 : 0);
+      const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+      this.x += nx * 2; this.y += ny * 2;
+      const imp = this.speed;                       // crash speed
+      this.vx *= 0.5; this.vy *= 0.5; this.speed *= 0.5;
+      if (imp > 25) {                               // reckless driving hurts
+        this.hp -= (imp - 25) * 0.11;
+        this.deformAtWorld(this.x - nx * 4, this.y - ny * 4, Math.min(0.7, imp / 220), env);
+        env.particles.sparks(this.x - nx * 4, this.y - ny * 4, 3);
+        env.sound.crash(imp / 280);
+        if (this.hp <= 0) { this.explode(env, this.explodePower()); return; }
+      }
+    }
+
+    // tyre smoke while drifting hard
+    if (Math.abs(vl) > 22 && Math.random() < 0.5) {
+      env.particles.tireSmoke(this.x, this.y, Math.min(1, Math.abs(vl) / 60));
+    }
+  }
+
   update(dt, env) {
     switch (this.mode) {
       case 'drive': this.updateDrive(dt, env); break;
       case 'turn': this.updateTurn(dt, env); break;
+      case 'pursue': this.updatePursue(dt, env); break;
       case 'shove': this.updateShove(dt, env); break;
       case 'wreck':
         this.smokeAcc += dt;
@@ -135,6 +232,26 @@ export class AICar {
         }
         break;
     }
+    if (this.type === 'gastruck') this.updateTrailer();
+    else if (this.police) this.lightT += dt;
+  }
+
+  // Trailer follows the cab through a kingpin: the rear axle is held at a fixed
+  // distance from the hitch and swings toward it, so the tank lags and bends
+  // around corners like a real semi.
+  updateTrailer() {
+    const f = [Math.sin(this.heading), -Math.cos(this.heading)];
+    const hx = this.x - f[0] * this.hitch, hy = this.y - f[1] * this.hitch; // hitch point
+    if (!this.trailerRear) {
+      this.trailerRear = [hx - f[0] * this.trailerLen, hy - f[1] * this.trailerLen];
+      this.trailerHeading = this.heading;
+      return;
+    }
+    let dx = hx - this.trailerRear[0], dy = hy - this.trailerRear[1];
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;                             // unit rear→hitch
+    this.trailerRear = [hx - dx * this.trailerLen, hy - dy * this.trailerLen];
+    this.trailerHeading = Math.atan2(dx, -dy);        // 0 = up, same as headings
   }
 
   updateDrive(dt, env) {
@@ -292,6 +409,7 @@ export class AICar {
           this.deformAtWorld(wx, wy, Math.min(0.8, imp / 200), env);
           env.sound.crash(imp / 260);
         }
+        if (this.canExplode && this.hp <= 0) { this.explode(env, this.explodePower()); return; }
       }
       this.x += nx * 1.5; this.y += ny * 1.5;
       break;
@@ -302,7 +420,12 @@ export class AICar {
       env.particles.tireSmoke(this.x, this.y, 0.4);
     }
     if (sp < 12 && this.shoveT <= 0) {
-      if (this.hp <= 0) { this.mode = 'wreck'; return; }
+      if (this.hp <= 0) {
+        if (this.canExplode) this.explode(env, this.explodePower());
+        else this.mode = 'wreck';
+        return;
+      }
+      if (this.pursuit) { this.mode = 'pursue'; return; } // shrug it off, keep chasing
       if (this.parkedOrigin) { this.mode = 'idle'; return; }
       this.realign(env.world);
     }
@@ -328,15 +451,106 @@ export class AICar {
   }
 
   applyHit(ix, iy, jx, jy, imp, env) {
-    // receive an impulse (jx,jy) at world point (ix,iy)
-    this.vx = this.velocity()[0] + jx;
-    this.vy = this.velocity()[1] + jy;
+    // receive an impulse (jx,jy) at world point (ix,iy). Heavier vehicles
+    // barely deflect (impulse ÷ mass) and take less damage.
+    const m = this.mass || 1;
+    this.vx = this.velocity()[0] + jx / m;
+    this.vy = this.velocity()[1] + jy / m;
     const rx = ix - this.x, ry = iy - this.y;
-    this.spinv += (rx * jy - ry * jx) * -0.02;
-    this.hp -= imp * 0.55;
-    this.mode = this.mode === 'wreck' ? 'wreck' : 'shove';
-    this.shoveT = 0.5;
+    this.spinv += (rx * (jy / m) - ry * (jx / m)) * -0.02;
+    // Cops take damage on the same scale as the player's car, but with a 200 hp
+    // pool (~2x the race car's 100), so they survive twice the punishment.
+    if (this.police) { if (imp > 22) this.hp -= (imp - 22) * 0.07; }
+    else this.hp -= imp * 0.55 / Math.sqrt(m);
     this.deformAtWorld(ix, iy, Math.min(1, imp / 160), env);
+    if (this.canExplode && this.hp <= 0) { this.explode(env, this.explodePower()); return; }
+    // Big rigs stay glued to their route: only a hit large relative to their
+    // mass (or one that finally totals them) knocks them into loose physics.
+    // Light vehicles (cars, bikes) always break loose as before.
+    if (this.mode === 'wreck') { /* stays wrecked */ }
+    else if (this.hp <= 0 || m <= 2 || imp > 20 * m) {
+      this.mode = 'shove';
+      this.shoveT = 0.5;
+    } else if (this.mode === 'drive' || this.mode === 'turn') {
+      this.speed = Math.max(0, this.speed - imp * 0.4); // just scrubs speed, keeps driving
+    }
+  }
+
+  // Vehicle destroyed: a fireball that damages everything nearby, then it
+  // burns out as a wreck. `power` scales the blast (the fuel tanker is bigger).
+  explode(env, power = 1) {
+    if (this.exploded) return;
+    this.exploded = true;
+    this.pursuit = false;
+    this.mode = 'wreck';
+    this.hp = -100;                 // wreck handler keeps it flaming
+    this.vx = this.vy = 0;
+    const R = 30 * power;           // splash radius
+    this.deformAtWorld(this.x, this.y, 1, env);
+    env.particles.sparks(this.x, this.y, Math.round(14 * power) + 4);
+    env.particles.debris(this.x, this.y, '#20202a', Math.round(10 * power) + 2, 150);
+    env.particles.debris(this.x, this.y, '#e3a24a', Math.round(6 * power) + 2, 130);
+    const nf = Math.round(12 * power) + 4;
+    for (let i = 0; i < nf; i++) {
+      env.particles.fire(this.x + (Math.random() - 0.5) * R, this.y + (Math.random() - 0.5) * R);
+    }
+    env.sound.crash(1);
+
+    // The tanker doesn't leave a wreck — it's blown to bits: 3-8 flying chunks,
+    // a pall of smoke, a scorch mark, and no truck left to draw.
+    if (this.type === 'gastruck') {
+      this.blownApart = true;
+      const cols = ['#c8ccd2', '#9aa0a8', '#e6e9ee', '#c23b3b', '#2a2a30'];
+      const chunks = 3 + Math.floor(Math.random() * 6);   // 3..8
+      for (let i = 0; i < chunks; i++) {
+        env.particles.chunk(this.x + (Math.random() - 0.5) * 12, this.y + (Math.random() - 0.5) * 12,
+          cols[Math.floor(Math.random() * cols.length)], 3 + Math.floor(Math.random() * 3));
+      }
+      for (let i = 0; i < 8; i++) {
+        env.particles.engineSmoke(this.x + (Math.random() - 0.5) * R * 0.6, this.y + (Math.random() - 0.5) * R * 0.6, true);
+      }
+      env.world.decal(this.x, this.y, (g) => { g.fillStyle = 'rgba(10,10,12,0.5)'; g.fillRect(-9, -9, 18, 18); });
+    }
+
+    // mayhem bonus: blowing up a vehicle is worth extra points
+    if (env.stats && env.stats.infractions) {
+      env.stats.infractions.blownUp = (env.stats.infractions.blownUp || 0) + 1;
+      env.stats.lastInfractionT = env.t;
+    }
+
+    if (env.obstacles) this.splashDamage(env, R, power);
+    const d = Math.hypot(this.x - env.player.x, this.y - env.player.y);
+    if (d < R * 7) env.camera.addTrauma(Math.min(0.95, power * (1 - d / (R * 7))));
+  }
+
+  // Area-of-effect blast: hurt & knock back every vehicle (and the player)
+  // within the radius, falling off with distance. Can chain-detonate cops and
+  // tankers caught in the blast.
+  splashDamage(env, R, power) {
+    for (const o of env.obstacles) {
+      if (o === this || !o) continue;
+      const dx = o.x - this.x, dy = o.y - this.y;
+      const d = Math.hypot(dx, dy);
+      if (d > R || d < 0.001) continue;
+      const f = 1 - d / R;
+      const nx = dx / d, ny = dy / d;
+      const push = 150 * f * power;
+      if (o === env.player) {
+        o.addDamage(32 * f * power, env);
+        o.vx += nx * push; o.vy += ny * push;
+        o.deformAtWorld(o.x - nx * 6, o.y - ny * 6, Math.min(1, f * power), env);
+      } else {
+        o.hp -= 70 * f * power;
+        const v = o.velocity ? o.velocity() : [o.vx, o.vy];
+        o.vx = v[0] + nx * push; o.vy = v[1] + ny * push;
+        if (o.mode !== 'wreck') { o.mode = 'shove'; o.shoveT = 0.5; }
+        o.deformAtWorld(o.x - nx * 6, o.y - ny * 6, Math.min(1, f), env);
+        if (o.hp <= 0) {
+          if (o.canExplode) o.explode(env, o.explodePower()); // chain reaction
+          else o.mode = 'wreck';
+        }
+      }
+    }
   }
 
   deformAtWorld(wx, wy, power, env) {
@@ -349,6 +563,7 @@ export class AICar {
   }
 
   draw(ctx, camX, camY) {
+    if (this.type === 'gastruck') { if (!this.blownApart) this.drawGasTruck(ctx, camX, camY); return; } // hidden once blown to bits
     ctx.save();
     ctx.translate(Math.round(this.x - camX), Math.round(this.y - camY));
     ctx.rotate(this.heading);
@@ -358,10 +573,40 @@ export class AICar {
       case 'schoolbus': this.drawBus(ctx, '#e6b400', '#2e2610', true); break;
       case 'citybus': this.drawBus(ctx, '#cbced4', '#c23b3b', false); break;
       case 'dumptruck': this.drawDumpTruck(ctx); break;
-      case 'gastruck': this.drawGasTruck(ctx); break;
+      case 'police': ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2); this.drawLightbar(ctx); break;
       default: ctx.drawImage(this.body.canvas, -CAR_W / 2, -CAR_H / 2);
     }
     ctx.restore();
+  }
+
+  // Small floating health bar, shown only once a vehicle has taken some damage
+  // (and isn't already a burnt-out wreck). Drawn unrotated in screen space.
+  drawDamageMeter(ctx, left, top) {
+    if (this.mode === 'wreck' || this.exploded) return;
+    const frac = this.hp / this.maxHp;
+    if (frac >= 1 || frac <= 0) return;
+    const sx = Math.round(this.x - left);
+    const sy = Math.round(this.y - top) - ((this.half || 12) + 4);
+    const bw = Math.max(10, Math.round(this.rad * 2) + 2), x0 = sx - (bw >> 1);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(x0 - 1, sy - 1, bw + 2, 4);
+    ctx.fillStyle = '#0c0c10'; ctx.fillRect(x0, sy, bw, 2);
+    ctx.fillStyle = frac > 0.5 ? '#39d353' : frac > 0.25 ? '#e8c33a' : '#e05545';
+    ctx.fillRect(x0, sy, Math.round(bw * frac), 2);
+  }
+
+  // Roof light bar. Steady & dim while patrolling; alternates bright red/blue
+  // once `pursuit` is set (the hook for the police-chase feature).
+  drawLightbar(ctx) {
+    ctx.fillStyle = '#101014';
+    ctx.fillRect(-3, -1, 6, 2);           // housing
+    let red = '#5a1414', blue = '#141c5a';
+    if (this.pursuit) {
+      const phase = Math.floor(this.lightT * 8) % 2;
+      red = phase ? '#ff2a2a' : '#4a0000';
+      blue = phase ? '#0a0a3a' : '#3a7bff';
+    }
+    ctx.fillStyle = red; ctx.fillRect(-3, -1, 3, 2);
+    ctx.fillStyle = blue; ctx.fillRect(0, -1, 3, 2);
   }
 
   // All drawn in local space, heading 0 = nose toward -y, body spanning
@@ -410,18 +655,44 @@ export class AICar {
     ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, -h, 1, h * 2); ctx.fillRect(w - 1, -h, 1, h * 2);
   }
 
-  drawGasTruck(ctx) {
-    const w = this.rad, h = this.half, L = h * 2;
-    const cab1 = -h + L * 0.26, tank0 = -h + L * 0.32;
-    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -h + 1, w * 2 + 1, L);
-    ctx.fillStyle = '#c23b3b'; ctx.fillRect(-w, -h, w * 2, cab1 - (-h));    // cab
-    ctx.fillStyle = '#20303c'; ctx.fillRect(-w + 1, -h + 1, w * 2 - 2, 2);
-    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-1, cab1, 2, tank0 - cab1);     // hitch
-    ctx.fillStyle = '#c8ccd2'; ctx.fillRect(-w, tank0, w * 2, h - tank0);   // silver tank
-    ctx.fillStyle = '#9aa0a8'; ctx.fillRect(-w, tank0, 1, h - tank0); ctx.fillRect(w - 1, tank0, 1, h - tank0);
-    ctx.fillStyle = '#e6e9ee'; ctx.fillRect(-1, tank0, 2, h - tank0);       // highlight ridge
-    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, tank0 + (h - tank0) * 0.5, w * 2, 1); // strap
-    ctx.fillStyle = '#e05545'; ctx.fillRect(-2, h - 4, 4, 3);               // hazard placard
+  // Articulated: the cab is drawn in its own frame and the tank trailer in the
+  // trailer frame (its own heading), hinged at the kingpin — so it bends
+  // through turns. Drawn directly in world space, not the shared draw() rotate.
+  drawGasTruck(ctx, camX, camY) {
+    const w = this.rad;
+    const f = [Math.sin(this.heading), -Math.cos(this.heading)];
+    const hx = this.x - f[0] * this.hitch, hy = this.y - f[1] * this.hitch; // kingpin
+    const th = this.trailerHeading != null ? this.trailerHeading : this.heading;
+    const ft = [Math.sin(th), -Math.cos(th)];
+    const tl = this.trailerLen;
+    const tcx = hx - ft[0] * tl / 2, tcy = hy - ft[1] * tl / 2;             // tank center
+
+    // --- tank trailer ---
+    ctx.save();
+    ctx.translate(Math.round(tcx - camX), Math.round(tcy - camY));
+    ctx.rotate(th);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -tl / 2 + 1, w * 2 + 1, tl);
+    ctx.fillStyle = '#c8ccd2'; ctx.fillRect(-w, -tl / 2, w * 2, tl);        // silver tank
+    ctx.fillStyle = '#9aa0a8'; ctx.fillRect(-w, -tl / 2, 1, tl); ctx.fillRect(w - 1, -tl / 2, 1, tl);
+    ctx.fillStyle = '#e6e9ee'; ctx.fillRect(-1, -tl / 2, 2, tl);            // highlight ridge
+    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, -tl / 2 + 3, w * 2, 1); ctx.fillRect(-w, tl / 2 - 5, w * 2, 1); // straps
+    ctx.fillStyle = '#e05545'; ctx.fillRect(-2, tl / 2 - 4, 4, 3);          // hazard placard (rear)
+    ctx.restore();
+
+    // --- coupling stub at the kingpin, masks the seam between the pieces ---
+    ctx.fillStyle = '#1c1c22';
+    ctx.fillRect(Math.round(hx - camX) - 1, Math.round(hy - camY) - 1, 3, 3);
+
+    // --- cab ---
+    const cl = this.cabLen;
+    ctx.save();
+    ctx.translate(Math.round(this.x - camX), Math.round(this.y - camY));
+    ctx.rotate(this.heading);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w, -cl / 2 + 1, w * 2 + 1, cl);
+    ctx.fillStyle = '#c23b3b'; ctx.fillRect(-w, -cl / 2, w * 2, cl);        // cab
+    ctx.fillStyle = '#20303c'; ctx.fillRect(-w + 1, -cl / 2 + 1, w * 2 - 2, 3); // windshield
+    ctx.fillStyle = '#2a2a30'; ctx.fillRect(-w, -cl / 2, 1, cl); ctx.fillRect(w - 1, -cl / 2, 1, cl);
+    ctx.restore();
   }
 }
 
@@ -431,6 +702,8 @@ export class Traffic {
     this.cars = [];
     this.parkedChunks = new Set();
     this.spawnT = 0;
+    this.pursuitT = 0;
+    this.copsDestroyed = 0;   // blown-up cruisers are never replaced
   }
 
   update(dt, env) {
@@ -441,17 +714,83 @@ export class Traffic {
     if (!this.world.flat && this.spawnT <= 0) {
       this.spawnT = 0.4;
       this.syncParked(player);
-      const driving = this.cars.filter(c => !c.parkedOrigin && c.mode !== 'wreck').length;
+      // pursuit cruisers don't count against the civilian traffic budget
+      const driving = this.cars.filter(c => !c.parkedOrigin && !c.pursuit && c.mode !== 'wreck').length;
       if (driving < TARGET_AI) this.trySpawn(player);
-      // despawn far cars
+      // despawn far cars (pursuit cars are kept alive at a longer range)
       for (let i = this.cars.length - 1; i >= 0; i--) {
         const c = this.cars[i];
-        if (Math.hypot(c.x - player.x, c.y - player.y) > DESPAWN_R) this.cars.splice(i, 1);
+        const r = c.pursuit ? 950 : DESPAWN_R;
+        if (Math.hypot(c.x - player.x, c.y - player.y) > r) this.cars.splice(i, 1);
       }
     }
 
+    this.updatePursuit(dt, env);
+
     for (const c of this.cars) c.update(dt, env);
     this.collide(env);
+  }
+
+  // Heat: one pursuit cruiser per 10 infractions, each arriving from off-screen.
+  updatePursuit(dt, env) {
+    this.pursuitT -= dt;
+    // once a cruiser blows up it's gone for good — tally destroyed cops so the
+    // dispatch target permanently drops and we never send a replacement
+    for (const c of this.cars) {
+      if (c.police && c.exploded && !c._countedDestroyed) { c._countedDestroyed = true; this.copsDestroyed++; }
+    }
+    const player = env.player;
+    const inf = env.stats && env.stats.infractions;
+    if (this.world.flat || !inf || player.dead) return;
+    const total = Object.values(inf).reduce((a, b) => a + b, 0);
+    const want = Math.floor(total / 10) - this.copsDestroyed;
+    if (want <= 0) return;
+    const active = this.pursuers();
+    if (active < want && this.pursuitT <= 0 && this.spawnPursuit(player)) this.pursuitT = 2;
+  }
+
+  // number of cop cars currently chasing the player (exploded cops clear their
+  // own pursuit flag, so they don't count)
+  pursuers() {
+    let n = 0;
+    for (const c of this.cars) if (c.pursuit) n++;
+    return n;
+  }
+
+  // Spawn a flashing cruiser on a road beyond the view, already hunting you.
+  spawnPursuit(player) {
+    const world = this.world;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const useV = Math.random() < 0.5;
+      const axisA = useV ? world.vA : world.hA;
+      const along = useV ? player.y : player.x;
+      const lat = useV ? player.x : player.y;
+      const k = axisA.locate(lat) + Math.floor(Math.random() * 4) - 1;
+      const roadC = axisA.center(k);
+      if (Math.abs(roadC - lat) > 500) continue;
+      const side = Math.random() < 0.5 ? 1 : -1;
+      const dist = 330 + Math.random() * 110;          // beyond the ~250px view radius
+      const dir = -side;                                // heading back toward the player
+      const perp = useV ? -dir : dir;
+      const posAlong = along + side * dist;
+      const x = useV ? roadC + perp * LANE : posAlong;
+      const y = useV ? posAlong : roadC + perp * LANE;
+      if (Math.hypot(x - player.x, y - player.y) < 300) continue; // must be off-screen
+      let blocked = false;
+      for (const c of this.cars) if (Math.hypot(c.x - x, c.y - y) < 40) { blocked = true; break; }
+      if (blocked) continue;
+      const dv = useV ? [0, dir] : [dir, 0];
+      const cop = new AICar(x, y, {
+        axis: useV ? 'v' : 'h', k, dir, mode: 'pursue',
+        heading: headingOf(dv[0], dv[1]), kind: 'police',
+      });
+      cop.pursuit = true;
+      cop.cruise = 105 + Math.random() * 22;           // cruises at a catchable pace…
+      cop.speed = cop.cruise * 0.85;
+      this.cars.push(cop);
+      return true;
+    }
+    return false;
   }
 
   syncParked(player) {
@@ -646,12 +985,18 @@ export class Traffic {
           P.vy += sgn * rec * ny;
           const rx = ix - P.x, ry = iy - P.y;
           P.spin += (rx * (sgn * rec * ny) - ry * (sgn * rec * nx)) * -0.015;
-          if (imp > 22) {
-            P.addDamage((imp - 22) * 0.07, env);
+          // a cruiser ram hurts at lower speeds and hits ~2x harder — it's out
+          // to total you
+          const ram = (isPA ? B : A).pursuit === true;
+          const thr = ram ? 8 : 22;
+          if (imp > thr) {
+            let dmg = (imp - thr) * 0.07;
+            if (ram) dmg = Math.min(35, dmg * 2.2);
+            P.addDamage(dmg, env);
             P.deformAtWorld(ix, iy, Math.min(1, imp / 180), env);
             if (env.t - (env.stats.lastCarHitT || -1) > 0.5) { env.stats.carsHit++; countWreck(env); }
             env.stats.lastCarHitT = env.t;
-            env.camera.addTrauma(Math.min(0.7, imp / 170) * (P.shakeMul || 1));
+            env.camera.addTrauma(Math.min(0.8, imp / (ram ? 130 : 170)) * (P.shakeMul || 1));
             env.sound.crash(imp / 150);
             env.particles.sparks(ix, iy, 5);
           }
@@ -669,10 +1014,12 @@ export class Traffic {
   }
 
   draw(ctx, camX, camY, W, H) {
+    const left = camX - W / 2, top = camY - H / 2;
     for (const c of this.cars) {
-      const m = (c.half || 12) + 8;
+      const m = (c.half || 12) + 16;
       if (Math.abs(c.x - camX) > W / 2 + m || Math.abs(c.y - camY) > H / 2 + m) continue;
-      c.draw(ctx, camX - W / 2, camY - H / 2);
+      c.draw(ctx, left, top);
+      c.drawDamageMeter(ctx, left, top);
     }
   }
 }

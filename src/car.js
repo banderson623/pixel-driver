@@ -331,10 +331,14 @@ export class PlayerCar {
         });
       }
     }
-    // damage smoke / fire
+    // damage shows as smoke, then flame — never dents/lost pixels on the body
     if (this.damage > 55 && Math.random() < (this.damage - 55) / 45 * 0.5) {
       const [fx, fy] = this.forward();
       env.particles.engineSmoke(this.x + fx * 7, this.y + fy * 7, this.damage > 82);
+    }
+    if (this.damage > 80 && !this.dead && Math.random() < (this.damage - 80) / 20 * 0.45) {
+      const [fx, fy] = this.forward();
+      env.particles.fire(this.x + fx * 6 + (Math.random() - 0.5) * 6, this.y + fy * 6 + (Math.random() - 0.5) * 6);
     }
     if (this.dead && Math.random() < 0.6) {
       env.particles.fire(this.x + (Math.random() - 0.5) * 8, this.y + (Math.random() - 0.5) * 10);
@@ -545,14 +549,10 @@ export class PlayerCar {
     }
   }
 
-  deformAtWorld(wx, wy, power, env) {
-    const dx = wx - this.x, dy = wy - this.y;
-    const cs = Math.cos(this.heading), sn = Math.sin(this.heading);
-    const lx = dx * cs + dy * sn + this.body.w / 2;
-    const ly = -dx * sn + dy * cs + this.body.h / 2;
-    const removed = this.body.deform(lx, ly, power);
-    for (const col of removed) if (col) env.particles.debris(wx, wy, col, 1, 90);
-  }
+  // The player's body is never visibly damaged — no dents or torn-off pixels.
+  // Damage is conveyed only through smoke and flame (see update()). This is a
+  // deliberate no-op so all the collision code can still call it harmlessly.
+  deformAtWorld(wx, wy, power, env) { /* player body stays intact by design */ }
 
   draw(ctx, camX, camY) {
     ctx.save();
