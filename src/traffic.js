@@ -90,6 +90,7 @@ export class AICar {
       : AI_COLORS[Math.floor(Math.random() * AI_COLORS.length)];
     this.body = new CarBody(scheme[0], scheme[1]);
     this.smokeAcc = 0;
+    this.honkT = Math.random() * 4;   // horn cooldown
 
     // vehicle type — same lane/light/turn rules for all, differing in size
     // (collision footprint via half/rad), speed, mass, durability and looks.
@@ -206,7 +207,7 @@ export class AICar {
         this.hp -= (imp - 25) * 0.11;
         this.deformAtWorld(this.x - nx * 4, this.y - ny * 4, Math.min(0.7, imp / 220), env);
         env.particles.sparks(this.x - nx * 4, this.y - ny * 4, 3);
-        env.sound.crash(imp / 280);
+        env.sound.crash(imp / 280, this.x, this.y);
         if (this.hp <= 0) { this.explode(env, this.explodePower()); return; }
       }
     }
@@ -234,6 +235,7 @@ export class AICar {
     }
     if (this.type === 'gastruck') this.updateTrailer();
     else if (this.police) this.lightT += dt;
+    if (this.honkT > 0) this.honkT -= dt;
   }
 
   // Trailer follows the cab through a kingpin: the rear axle is held at a fixed
@@ -293,6 +295,7 @@ export class AICar {
     // obstacle probe (cars + player ahead)
     const probe = 16 + this.speed * 0.6;
     const pax = this.x + dv[0] * probe, pay = this.y + dv[1] * probe;
+    let blocked = false;
     for (const o of env.obstacles) {
       if (o === this) continue;
       const ddx = o.x - pax, ddy = o.y - pay;
@@ -301,7 +304,12 @@ export class AICar {
         ts = Math.min(ts, Math.max(0, (dd - 22) * 1.6));
       }
       const cdx = o.x - this.x, cdy = o.y - this.y;
-      if (cdx * dv[0] + cdy * dv[1] > 0 && cdx * cdx + cdy * cdy < 24 * 24) ts = Math.min(ts, 6);
+      if (cdx * dv[0] + cdy * dv[1] > 0 && cdx * cdx + cdy * cdy < 24 * 24) { ts = Math.min(ts, 6); blocked = true; }
+    }
+    // lay on the horn when something's stopped in front of you (city ambiance)
+    if (blocked && this.honkT <= 0 && env.sound) {
+      const dp = Math.hypot(this.x - env.player.x, this.y - env.player.y);
+      if (dp < 320 && Math.random() < 0.5) { env.sound.honk(this.x, this.y); this.honkT = 1.6 + Math.random() * 2.6; }
     }
 
     if (this.speed < ts) this.speed = Math.min(ts, this.speed + 75 * dt);
@@ -407,7 +415,7 @@ export class AICar {
           const destroyed = world.damage(wx, wy, 2 + imp / 60, Math.min(0.8, imp / 150));
           for (const col of destroyed) env.particles.debris(wx, wy, col, 1, 60);
           this.deformAtWorld(wx, wy, Math.min(0.8, imp / 200), env);
-          env.sound.crash(imp / 260);
+          env.sound.crash(imp / 260, this.x, this.y);
         }
         if (this.canExplode && this.hp <= 0) { this.explode(env, this.explodePower()); return; }
       }
@@ -494,7 +502,7 @@ export class AICar {
     for (let i = 0; i < nf; i++) {
       env.particles.fire(this.x + (Math.random() - 0.5) * R, this.y + (Math.random() - 0.5) * R);
     }
-    env.sound.crash(1);
+    env.sound.crash(1, this.x, this.y);
 
     // The tanker doesn't leave a wreck — it's blown to bits: 3-8 flying chunks,
     // a pall of smoke, a scorch mark, and no truck left to draw.
@@ -1005,7 +1013,7 @@ export class Traffic {
         if (!isPA) A.applyHit(ix, iy, -j * nx, -j * ny, imp, env);
         if (!isPB) B.applyHit(ix, iy, j * nx, j * ny, imp, env);
         if (!isPA && !isPB && imp > 25) {
-          env.sound.crash(imp / 220);
+          env.sound.crash(imp / 220, ix, iy);
           env.particles.sparks(ix, iy, 4);
         }
         return;

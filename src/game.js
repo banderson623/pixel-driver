@@ -218,11 +218,19 @@ export class Game {
     this.stats.dist += this.player.speed() * dt * 0.19 / 1609; // px→m→mi
 
     // audio
+    this.sound.setListener(this.player.x, this.player.y);
     const [fx, fy] = this.player.forward();
     const vf = Math.abs(this.player.vx * fx + this.player.vy * fy);
     const rpm = Math.min(1, vf / 250) * 0.8 + (this.input.down('ArrowUp', 'KeyW') ? 0.2 : 0);
     this.sound.setEngine(rpm, !this.player.dead);
     this.sound.setSkid(this.player.skidding ? this.player.skidLevel : 0);
+    // sirens wail louder the closer the nearest pursuing cop is
+    let siren = 0;
+    for (const c of this.traffic.cars) {
+      if (!c.pursuit) continue;
+      siren = Math.max(siren, 1 - Math.hypot(c.x - this.player.x, c.y - this.player.y) / 520);
+    }
+    this.sound.setSiren(siren);
 
     if (this.player.damage >= 100 && !this.player.dead) {
       this.player.dead = true;
@@ -240,6 +248,7 @@ export class Game {
       this.state = 'menu';
       this.sound.setEngine(0, false);
       this.sound.setSkid(0);
+      this.sound.setSiren(0);
       this.buildMenuWorld();
     }
   }
@@ -325,8 +334,10 @@ export class Game {
     this.particles.update(dt);
     this.updateEmitters(dt);
     this.camera.update(dt, this.player);
+    this.sound.setListener(this.player.x, this.player.y);
     this.sound.setEngine(0, false);
     this.sound.setSkid(0);
+    this.sound.setSiren(0);
 
     if (this.deathT > 1 && this.input.pressed('KeyR')) this.startRun();
     if (this.input.pressed('Escape')) {
