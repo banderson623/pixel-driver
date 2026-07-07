@@ -12,9 +12,24 @@ export const CELL = 2;
 export const CHUNK = 256;
 const CPC = CHUNK / CELL; // cells per chunk side
 
-export const ROAD_HALF = 24;   // half width of asphalt
+export const ROAD_HALF = 24;   // half width of asphalt (a plain "local" road)
 export const SIDEWALK = 10;
-export const EDGE = ROAD_HALF + SIDEWALK; // road center -> block edge
+export const EDGE = ROAD_HALF + SIDEWALK; // nominal; per-road edge = half(k)+SIDEWALK
+
+// ---------------------------------------------------- road-type tuning knobs
+// All roads regenerate from these on a new seed (roads bake into chunk canvases,
+// so changing a value takes effect on the next world rebuild, not live). Every
+// grid line independently rolls a rank (local / highway) and, if local, may
+// wobble; every straight-local intersection may roll a roundabout.
+const HWY_HALF   = 42;    // highway asphalt half-width (vs ROAD_HALF for local)
+const HWY_RATE   = 0.20;  // chance a grid line is a highway
+const HWY_LANES  = 2;     // lanes per direction on a highway
+const HWY_SPEED  = 1.6;   // traffic cruise multiplier on a highway
+const CURVE_RATE = 0.38;  // chance a (non-highway) road bends
+const CURVE_AMP  = 30;    // lateral shift of one road bend (px)
+const CURVE_SEG  = 320;   // spacing between possible bends (px)
+const CURVE_TURN = 60;    // length of the smooth 90°-ish corner itself (px)
+const RBOUT_RATE = 0.24;  // chance a straight-local intersection is a roundabout
 
 // ---------------------------------------------------------------- palette
 export const PAL = [];
@@ -159,12 +174,65 @@ class Axis {
     this.seed = seed; this.id = id;
     this.c = [0]; this.lo = 0; this.hi = 0;
     this.lastK = 0;
+    this._meta = new Map();
   }
   gap(k) { return 310 + Math.floor(hash3(this.seed, this.id, k, 11) * 210); }
+
+  // Per-road profile, cached by line index. `hwy` roads are wide, multi-lane
+  // and fast; a fraction of the rest bend (amp>0). A bendy road holds a dead
+  // straight line, makes one smooth 90°-ish corner to a new parallel line,
+  // holds that, and so on — never a continuous wobble. The lateral shift is
+  // bounded (±amp) well under the min gap, so a bent road never reaches its
+  // straight neighbours and center()/nearest() (straight-grid indexing) stay
+  // valid.
+  meta(k) {
+    let m = this._meta.get(k);
+    if (m) return m;
+    const hwy = hash3(this.seed, this.id, k, 41) < HWY_RATE;
+    const curvy = !hwy && hash3(this.seed, this.id, k, 42) < CURVE_RATE;
+    m = {
+      hwy, half: hwy ? HWY_HALF : ROAD_HALF,
+      lanes: hwy ? HWY_LANES : 1, speedMul: hwy ? HWY_SPEED : 1,
+      amp: curvy ? CURVE_AMP : 0,
+      seg: CURVE_SEG * (0.8 + 0.4 * hash3(this.seed, this.id, k, 44)),
+      soff: hash3(this.seed, this.id, k, 45),   // phase so bends don't line up
+    };
+    this._meta.set(k, m);
+    return m;
+  }
+  half(k) { return this.meta(k).half; }
+  lanes(k) { return this.meta(k).lanes; }
+  speedMul(k) { return this.meta(k).speedMul; }
+  amp(k) { return this.meta(k).amp; }
+
   center(k) {
     while (this.hi < k) { this.c.push(this.c[this.c.length - 1] + this.gap(this.hi)); this.hi++; }
     while (this.lo > k) { this.c.unshift(this.c[0] - this.gap(this.lo - 1)); this.lo--; }
     return this.c[k - this.lo];
+  }
+  // The lateral level of a bendy road holds at one of three lanes {-amp,0,amp}
+  // per segment, so consecutive segments give a crisp 0/±1/±2-step corner.
+  level(k, n) { return Math.floor(hash3(this.seed, this.id, k * 1009 + n, 47) * 3) - 1; }
+  // lateral offset of road k's centerline at along-coordinate s (0 if straight):
+  // flat for most of each segment, then a single smoothstep corner to the next
+  // level — a clean turn, not a sine wave.
+  offset(k, s) {
+    const m = this.meta(k);
+    if (!m.amp) return 0;
+    const u = s / m.seg + m.soff;
+    const n = Math.floor(u), f = u - n;
+    const L0 = this.level(k, n), L1 = this.level(k, n + 1);
+    const tf = CURVE_TURN / m.seg, ts = 1 - tf;     // corner occupies the last tf of a segment
+    if (f < ts || L0 === L1) return L0 * m.amp;
+    const t = (f - ts) / tf, sm = t * t * (3 - 2 * t);
+    return (L0 + (L1 - L0) * sm) * m.amp;
+  }
+  // actual (possibly curved) centerline position at along-coordinate s
+  centerAt(k, s) { return this.center(k) + this.offset(k, s); }
+  // d(lateral)/d(along): the local tangent slope, for heading along a curve
+  slope(k, s) {
+    if (!this.meta(k).amp) return 0;
+    return (this.offset(k, s + 5) - this.offset(k, s - 5)) / 10;
   }
   locate(x) {
     let k = this.lastK;
@@ -229,8 +297,29 @@ export class World {
     this.hA = new Axis(this.seed, 2);
     this.chunks = new Map();
     this.blocks = new Map();
+    this.rbouts = new Map();
     this.emitters = [];
     this.focusX = 0; this.focusY = 0;
+  }
+
+  // Roundabout at the (i,j) intersection, or null. Only placed where both roads
+  // are straight and local — a highway barrels through, and a wobbly road would
+  // meet the ring at an awkward angle. Returns the island geometry; cached since
+  // classify() asks per pixel. { cx,cy: center, rIn: island radius, rOut: outer
+  // drivable radius }.
+  roundabout(i, j) {
+    const key = i + '_' + j;
+    if (this.rbouts.has(key)) return this.rbouts.get(key);
+    const mv = this.vA.meta(i), mh = this.hA.meta(j);
+    let rb = null;
+    if (!mv.hwy && !mh.hwy && !mv.amp && !mh.amp &&
+        hash3(this.seed, i, j, 61) < RBOUT_RATE) {
+      const m = Math.max(mv.half, mh.half);
+      rb = { cx: this.vA.center(i), cy: this.hA.center(j), rIn: m - 6, rOut: m + 14 };
+    }
+    if (this.rbouts.size > 400) this.rbouts.delete(this.rbouts.keys().next().value);
+    this.rbouts.set(key, rb);
+    return rb;
   }
 
   noise(wx, wy) {
@@ -240,7 +329,11 @@ export class World {
   }
 
   // ---- traffic lights
-  hasLight(vi, hj) { return hash3(this.seed, vi, hj, 5) < 0.7; }
+  hasLight(vi, hj) {
+    if (this.roundabout(vi, hj)) return false;      // roundabouts yield, no signal
+    if (this.vA.meta(vi).hwy || this.hA.meta(hj).hwy) return false; // highways flow free
+    return hash3(this.seed, vi, hj, 5) < 0.7;
+  }
   lightPhase(vi, hj, t) {
     const off = hash3(this.seed, vi, hj, 9) * 12;
     const s = (t + off) % 12;
@@ -255,8 +348,12 @@ export class World {
     const key = i + ',' + j;
     let L = this.blocks.get(key);
     if (L) return L;
-    const x0 = this.vA.center(i) + EDGE, x1 = this.vA.center(i + 1) - EDGE;
-    const y0 = this.hA.center(j) + EDGE, y1 = this.hA.center(j + 1) - EDGE;
+    // inset each side by its road's half-width + sidewalk + wobble reach, so
+    // buildings never spill onto a wide or curving road
+    const x0 = this.vA.center(i)     + this.vA.half(i)     + SIDEWALK + this.vA.amp(i);
+    const x1 = this.vA.center(i + 1) - this.vA.half(i + 1) - SIDEWALK - this.vA.amp(i + 1);
+    const y0 = this.hA.center(j)     + this.hA.half(j)     + SIDEWALK + this.hA.amp(j);
+    const y1 = this.hA.center(j + 1) - this.hA.half(j + 1) - SIDEWALK - this.hA.amp(j + 1);
     const w = x1 - x0, h = y1 - y0;
     let n = 0;
     const R = () => hash3(this.seed ^ 0x51ab, i, j, n++);
@@ -368,35 +465,79 @@ export class World {
       return this.noise(wx, wy) < 0.12 ? T.ASPH2 : T.ASPH;
     }
     const nv = this.vA.nearest(wx), nh = this.hA.nearest(wy);
-    const dxv = wx - nv.c, dyh = wy - nh.c;
+    const mv = this.vA.meta(nv.k), mh = this.hA.meta(nh.k);
+    const hv = mv.half, hh = mh.half;               // this road's half-widths
+    // actual (possibly curved) centerlines through this pixel
+    const cvx = nv.c + this.vA.offset(nv.k, wy);
+    const chy = nh.c + this.hA.offset(nh.k, wx);
+    const dxv = wx - cvx, dyh = wy - chy;
     const adx = Math.abs(dxv), ady = Math.abs(dyh);
-    const inRX = adx < ROAD_HALF, inRY = ady < ROAD_HALF;
     const nz = this.noise(wx, wy);
+    const asph = () => nz < 0.12 ? T.ASPH2 : T.ASPH;
 
-    if (inRX && inRY) return nz < 0.12 ? T.ASPH2 : T.ASPH;
-
-    if (inRX) { // on a vertical road
-      if (ady >= ROAD_HALF + 2 && ady < ROAD_HALF + 10) {
-        if ((((wx - nv.c + ROAD_HALF) >> 2) & 1) === 0) return T.CROSS;
-        return nz < 0.12 ? T.ASPH2 : T.ASPH;
+    // roundabout: a ring of asphalt around a central island, replacing the
+    // normal crossroads square. Handled before everything else so it wins.
+    const rb = this.roundabout(nv.k, nh.k);
+    if (rb) {
+      const rd = Math.hypot(wx - rb.cx, wy - rb.cy);
+      if (rd < rb.rIn - 4) return nz < 0.3 ? T.GRASS2 : T.GRASS;   // island lawn
+      if (rd < rb.rIn) return T.CURB;                              // island kerb
+      if (rd < rb.rOut) {                                          // circulating lane
+        // dashed lane hint just inside the outer edge
+        if (rd > rb.rOut - 3 && (Math.floor((Math.atan2(wy - rb.cy, wx - rb.cx) + Math.PI) * rb.rOut / 6) & 1) === 0) return T.LANEW;
+        return asph();
       }
-      if (ady >= ROAD_HALF + 11 && ady < ROAD_HALF + 14 && dxv * dyh > 0) return T.LANEW;
-      if (adx < 1 && ady > ROAD_HALF + 16 && Math.floor(wy / 12) % 2 === 0) return T.LANEY;
-      return nz < 0.12 ? T.ASPH2 : T.ASPH;
-    }
-    if (inRY) { // on a horizontal road
-      if (adx >= ROAD_HALF + 2 && adx < ROAD_HALF + 10) {
-        if ((((wy - nh.c + ROAD_HALF) >> 2) & 1) === 0) return T.CROSS;
-        return nz < 0.12 ? T.ASPH2 : T.ASPH;
+      if (rd < rb.rOut + SIDEWALK) {
+        if (adx < hv || ady < hh) return asph();                  // let approaches punch through
+        if (rd < rb.rOut + 2) return T.CURB;
+        if ((wx & 15) === 0 || (wy & 15) === 0) return T.SIDEC;
+        return nz < 0.25 ? T.SIDE2 : T.SIDE;
       }
-      if (adx >= ROAD_HALF + 11 && adx < ROAD_HALF + 14 && dxv * dyh < 0) return T.LANEW;
-      if (ady < 1 && adx > ROAD_HALF + 16 && Math.floor(wx / 12) % 2 === 0) return T.LANEY;
-      return nz < 0.12 ? T.ASPH2 : T.ASPH;
+      // else: fall through to normal road/block classification (approach legs)
     }
 
-    if (adx < EDGE || ady < EDGE) { // sidewalk ring
-      if (adx >= ROAD_HALF && adx < ROAD_HALF + 2 && adx < EDGE) return T.CURB;
-      if (ady >= ROAD_HALF && ady < ROAD_HALF + 2 && ady < EDGE) return T.CURB;
+    const inRX = adx < hv, inRY = ady < hh;
+    if (inRX && inRY) return asph();                // intersection = union of both widths
+
+    // dashed white lane dividers + solid double-yellow median on a wide road
+    const hwyMark = (m, lat, along, alongEdge) => {
+      if (!m.hwy || along <= alongEdge + 12) return -1;
+      if (lat < 1) return T.LANEY;                  // double yellow ...
+      if (lat >= 3 && lat < 4) return T.LANEY;      // ... median
+      const lw = m.half / m.lanes;
+      for (let l = 1; l < m.lanes; l++) {
+        if (Math.abs(lat - l * lw) < 1 && Math.floor(along / 10) % 2 === 0) return T.LANEW;
+      }
+      return -1;
+    };
+
+    if (inRX) { // on a vertical road (along = y)
+      if (ady >= hh + 2 && ady < hh + 10) {
+        if ((((wx - cvx + hv) >> 2) & 1) === 0) return T.CROSS;
+        return asph();
+      }
+      if (ady >= hh + 11 && ady < hh + 14 && dxv * dyh > 0) return T.LANEW;
+      const hm = hwyMark(mv, adx, ady, hh);
+      if (hm >= 0) return hm;
+      if (!mv.hwy && adx < 1 && ady > hh + 16 && Math.floor(wy / 12) % 2 === 0) return T.LANEY;
+      return asph();
+    }
+    if (inRY) { // on a horizontal road (along = x)
+      if (adx >= hv + 2 && adx < hv + 10) {
+        if ((((wy - chy + hh) >> 2) & 1) === 0) return T.CROSS;
+        return asph();
+      }
+      if (adx >= hv + 11 && adx < hv + 14 && dxv * dyh < 0) return T.LANEW;
+      const hm = hwyMark(mh, ady, adx, hv);
+      if (hm >= 0) return hm;
+      if (!mh.hwy && ady < 1 && adx > hv + 16 && Math.floor(wx / 12) % 2 === 0) return T.LANEY;
+      return asph();
+    }
+
+    const edgeV = hv + SIDEWALK, edgeH = hh + SIDEWALK;
+    if (adx < edgeV || ady < edgeH) { // sidewalk ring
+      if (adx >= hv && adx < hv + 2 && adx < edgeV) return T.CURB;
+      if (ady >= hh && ady < hh + 2 && ady < edgeH) return T.CURB;
       if ((wx & 15) === 0 || (wy & 15) === 0) return T.SIDEC;
       return nz < 0.25 ? T.SIDE2 : T.SIDE;
     }
@@ -479,42 +620,51 @@ export class World {
       ch.props.push(Object.assign({ type: t, x, y, r: d.r, breakAt: d.breakAt, dmg: d.dmg, broken: false }, extra));
     };
 
-    // roads crossing this chunk (with margin)
+    // roads crossing this chunk (with margin sized for the widest road)
+    const MARG = HWY_HALF + SIDEWALK + 10;
     const vroads = [], hroads = [];
     {
-      let k = this.vA.locate(x0 - EDGE - 10);
-      while (this.vA.center(k) < x1 + EDGE + 10) {
-        if (this.vA.center(k) > x0 - EDGE - 10) vroads.push({ k, c: this.vA.center(k) });
+      let k = this.vA.locate(x0 - MARG);
+      while (this.vA.center(k) < x1 + MARG) {
+        if (this.vA.center(k) > x0 - MARG) vroads.push({ k, c: this.vA.center(k), half: this.vA.half(k) });
         k++;
       }
-      k = this.hA.locate(y0 - EDGE - 10);
-      while (this.hA.center(k) < y1 + EDGE + 10) {
-        if (this.hA.center(k) > y0 - EDGE - 10) hroads.push({ k, c: this.hA.center(k) });
+      k = this.hA.locate(y0 - MARG);
+      while (this.hA.center(k) < y1 + MARG) {
+        if (this.hA.center(k) > y0 - MARG) hroads.push({ k, c: this.hA.center(k), half: this.hA.half(k) });
         k++;
       }
     }
 
-    // intersections: traffic lights or stop signs at corners
+    // intersections: a roundabout gets a planted centre island; otherwise
+    // traffic lights or stop signs sit at the corners
     for (const v of vroads) for (const h of hroads) {
+      const rb = this.roundabout(v.k, h.k);
+      if (rb) {
+        if (inCh(rb.cx, rb.cy)) mkProp(hash3(this.seed, v.k, h.k, 62) < 0.5 ? 'tree0' : 'planter', rb.cx, rb.cy);
+        continue;
+      }
       const lit = this.hasLight(v.k, h.k);
+      const cvx = v.c + this.vA.offset(v.k, h.c), chy = h.c + this.hA.offset(h.k, v.c);
       for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
-        const px = v.c + sx * (ROAD_HALF + 4), py = h.c + sy * (ROAD_HALF + 4);
+        const px = cvx + sx * (v.half + 4), py = chy + sy * (h.half + 4);
         if (!inCh(px, py)) continue;
         if (lit) mkProp('light', px, py, { vi: v.k, hj: h.k, facing: sx * sy > 0 ? 'ns' : 'ew' });
         else if (sx * sy > 0) mkProp('sign', px, py);
       }
     }
 
-    const nearH = (y) => hroads.some(h => Math.abs(y - h.c) < EDGE + 14);
-    const nearV = (x) => vroads.some(v => Math.abs(x - v.c) < EDGE + 14);
+    const nearH = (y) => hroads.some(h => Math.abs(y - h.c) < h.half + SIDEWALK + 14);
+    const nearV = (x) => vroads.some(v => Math.abs(x - v.c) < v.half + SIDEWALK + 14);
 
     // sidewalk furniture along vertical roads
     for (const v of vroads) {
       for (let s = Math.floor((y0 - 10) / 96); s <= Math.ceil((y1 + 10) / 96); s++) {
         const py = s * 96 + hash3(this.seed, v.k, s, 21) * 24;
         if (nearH(py)) continue;
+        const cvx = v.c + this.vA.offset(v.k, py);
         for (const side of [-1, 1]) {
-          const px = v.c + side * (ROAD_HALF + 5);
+          const px = cvx + side * (v.half + 5);
           if (!inCh(px, py)) continue;
           const r = hash3(this.seed, v.k * 2 + (side > 0 ? 1 : 0), s, 22);
           if (r < 0.55) mkProp('lamp', px, py);
@@ -540,8 +690,9 @@ export class World {
       for (let s = Math.floor((x0 - 10) / 96); s <= Math.ceil((x1 + 10) / 96); s++) {
         const px = s * 96 + hash3(this.seed, h.k, s, 23) * 24;
         if (nearV(px)) continue;
+        const chy = h.c + this.hA.offset(h.k, px);
         for (const side of [-1, 1]) {
-          const py = h.c + side * (ROAD_HALF + 5);
+          const py = chy + side * (h.half + 5);
           if (!inCh(px, py)) continue;
           const r = hash3(this.seed, h.k * 2 + (side > 0 ? 1 : 0), s, 24);
           if (r < 0.55) mkProp('lamp', px, py);

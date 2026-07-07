@@ -6,12 +6,13 @@
 // The player can mow them down: a hit sprays blood, stains the ground, and
 // (in Rap Sheet mode) counts as an infraction.
 
-import { ROAD_HALF, SIDEWALK } from './world.js';
+import { SIDEWALK } from './world.js';
 
-// sidewalk centerline offset from a road center. ROAD_HALF+SIDEWALK/2 = 29,
-// which sits inside the crosswalk band [ROAD_HALF+2, ROAD_HALF+10] = [26,34].
-const SIDE_OFF = ROAD_HALF + SIDEWALK / 2;
-const CROSS_BAND = ROAD_HALF + 6; // along-offset from an intersection to a crosswalk
+// Sidewalk centreline offset from a road centre = half(k)+SIDEWALK/2, which
+// lands inside that road's crosswalk band. Scales with the road's width, so
+// pedestrians hug the kerb of a wide highway just as they do a narrow street.
+const sideOff = (axis, k) => axis.half(k) + SIDEWALK / 2;
+const crossBand = (axis, k) => axis.half(k) + 6; // along-offset to the crosswalk
 const TARGET = 12;
 const DESPAWN_R = 460;
 const HIT_R = 8;
@@ -27,8 +28,8 @@ class Ped {
     this.id = uid++;
     this.axis = axis; this.k = k; this.side = side; this.dir = dir;
     this.along = along;
-    const roadC = (axis === 'v' ? world.vA : world.hA).center(k);
-    this.lat = roadC + side * SIDE_OFF;
+    const ax = axis === 'v' ? world.vA : world.hA;
+    this.lat = ax.centerAt(k, along) + side * sideOff(ax, k);
     this.speed = 11 + Math.random() * 11;
     this.pauseT = 0;
     this.mode = 'walk';       // walk | cross
@@ -56,13 +57,14 @@ class Ped {
     const world = env.world;
     const axisA = this.axis === 'v' ? world.vA : world.hA;
     const perpA = this.axis === 'v' ? world.hA : world.vA;
-    const roadC = axisA.center(this.k);
+    const roadC = axisA.centerAt(this.k, this.along);
+    const off = sideOff(axisA, this.k);
     this.step += this.speed * dt * 0.35;
 
     // crossing the street to the opposite sidewalk (moving laterally along a
     // crosswalk band, `along` held fixed)
     if (this.mode === 'cross') {
-      const target = roadC - this.side * SIDE_OFF;
+      const target = roadC - this.side * off;
       const stepLat = this.speed * dt;
       if (Math.abs(target - this.lat) <= stepLat) {
         this.lat = target; this.side = -this.side; this.mode = 'walk';
@@ -76,7 +78,7 @@ class Ped {
     if (this.pauseT > 0) { this.pauseT -= dt; this.syncXY(); return; }
 
     // keep to the sidewalk centerline and stroll along it
-    const laneC = roadC + this.side * SIDE_OFF;
+    const laneC = roadC + this.side * off;
     this.lat += (laneC - this.lat) * Math.min(1, 6 * dt);
     this.along += this.dir * this.speed * dt;
 
@@ -84,7 +86,7 @@ class Ped {
     // (going straight already tracks the perpendicular road's crosswalk)
     const j = perpA.locate(this.along);
     const jn = this.dir > 0 ? j + 1 : j;
-    const nearBand = perpA.center(jn) - this.dir * CROSS_BAND;
+    const nearBand = perpA.center(jn) - this.dir * crossBand(perpA, jn);
     if (this.lastCross !== jn && Math.abs(this.along - nearBand) < 4) {
       this.lastCross = jn;
       const r = Math.random();

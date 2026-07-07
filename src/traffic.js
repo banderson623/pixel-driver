@@ -3,13 +3,22 @@
 // physics when the player slams into them. Parked cars use the same bodies.
 
 import { CarBody, CAR_W, CAR_H, AI_COLORS } from './car.js';
-import { ROAD_HALF } from './world.js';
 import { hash3 } from './rng.js';
 
-const LANE = 12;
-const BIKE_LANE = LANE + 7; // cyclists hug the curb
 const TARGET_AI = 13;
 const DESPAWN_R = 580;
+
+// Right-hand lane centre offset from a road's centreline, for road index k.
+// Scales with the road's half-width and lane count: a highway has a painted
+// median plus N lanes each way, a local road one lane; bikes hug the curb
+// whatever the width. `li` selects the lane (0 = innermost, next to centre).
+function laneOff(axis, k, li, bike) {
+  const m = axis.meta(k);
+  if (bike) return m.half - 4;
+  const median = m.hwy ? 4 : 0;
+  const lw = (m.half - median) / m.lanes;
+  return median + lw * (Math.min(li || 0, m.lanes - 1) + 0.5);
+}
 
 const BIKE_SHIRTS = ['#d24b4b', '#3f78d2', '#3fae55', '#d2a53a', '#8f4fd2', '#31b0b0'];
 const BIKE_SKIN = ['#caa07a', '#a5744c', '#e3b98f', '#8a5a34'];
@@ -102,7 +111,7 @@ export class AICar {
     this.cruise = cfg.cruiseLo + Math.random() * (cfg.cruiseHi - cfg.cruiseLo);
     this.hp = cfg.hpLo + Math.random() * (cfg.hpHi - cfg.hpLo);
     this.maxHp = this.hp;           // for the little on-screen damage meter
-    this.laneOff = this.bike ? BIKE_LANE : LANE;
+    this.laneIndex = opts.laneIndex || 0;  // which lane (0 = next to centreline)
     if (this.bike || this.type === 'motorcycle') { // has a visible rider
       this.frame = BIKE_FRAMES[Math.floor(Math.random() * BIKE_FRAMES.length)];
       this.shirt = BIKE_SHIRTS[Math.floor(Math.random() * BIKE_SHIRTS.length)];
@@ -237,6 +246,7 @@ export class AICar {
     switch (this.mode) {
       case 'drive': this.updateDrive(dt, env); break;
       case 'turn': this.updateTurn(dt, env); break;
+      case 'round': this.updateRound(dt, env); break;
       case 'pursue': this.updatePursue(dt, env); break;
       case 'shove': this.updateShove(dt, env); break;
       case 'wreck':
@@ -278,22 +288,32 @@ export class AICar {
     const axisB = this.axis === 'v' ? world.hA : world.vA;   // crossing roads
     const posAlong = this.axis === 'v' ? this.y : this.x;
     const posLat = this.axis === 'v' ? this.x : this.y;
-    const roadC = axisA.center(this.k);
+    const roadC = axisA.centerAt(this.k, posAlong);      // curved centreline here
 
     // lane keeping: right-hand traffic
-    // perp(dx,dy) = (-dy,dx): lane center = road center + perp*LANE
+    // perp(dx,dy) = (-dy,dx): lane center = road center + perp*laneOff
     const perp = this.axis === 'v' ? -this.dir : this.dir;
-    const laneC = roadC + perp * this.laneOff;
+    const laneC = roadC + perp * laneOff(axisA, this.k, this.laneIndex, this.bike);
     const latFix = (laneC - posLat) * Math.min(1, 4 * dt);
 
     // next crossing road
     const j = axisB.locate(posAlong);
     const jn = this.dir > 0 ? j + 1 : j;
     const crossC = axisB.center(jn);
-    const stopAt = crossC - this.dir * (ROAD_HALF + 16);
+    const crossHalf = axisB.half(jn);                    // width of the road ahead
+    const stopAt = crossC - this.dir * (crossHalf + 16);
     const dStop = (stopAt - posAlong) * this.dir;
 
-    let ts = this.cruise;
+    // roundabout dead ahead → circulate instead of crossing/turning
+    const rvi = this.axis === 'v' ? this.k : jn;
+    const rhj = this.axis === 'v' ? jn : this.k;
+    const rb = world.roundabout(rvi, rhj);
+    if (rb && Math.hypot(this.x - rb.cx, this.y - rb.cy) < rb.rOut + 3) {
+      this.beginRound(rb, rvi, rhj);
+      return;
+    }
+
+    let ts = this.cruise * axisA.speedMul(this.k);       // highways run faster
 
     // traffic light
     const vi = this.axis === 'v' ? this.k : jn;
@@ -331,26 +351,27 @@ export class AICar {
     else this.speed = Math.max(ts, this.speed - 170 * dt);
 
     // begin a turn?
-    const entry = crossC - this.dir * (ROAD_HALF + 2);
+    const entry = crossC - this.dir * (crossHalf + 2);
     const dEntry = (entry - posAlong) * this.dir;
     if (this.action !== 'straight' && dEntry <= 1 && dEntry > -10 && this.speed > 4) {
       this.beginTurn(env, crossC, jn);
       return;
     }
-    // passed the intersection → decide next move
-    if (dEntry <= -ROAD_HALF * 2) {
-      // (this triggers repeatedly until next intersection ahead changes; cheap to just re-roll rarely)
-    }
-    if ((crossC - posAlong) * this.dir < -(ROAD_HALF + 20) && this.lastCross !== jn) {
+    // passed the intersection → decide the next move
+    if ((crossC - posAlong) * this.dir < -(crossHalf + 20) && this.lastCross !== jn) {
       this.lastCross = jn;
       this.chooseAction();
     }
 
-    // advance
+    // advance along the (possibly curved) road: heading tracks the local
+    // tangent so cars lean into curves instead of crabbing straight
+    const sl = axisA.slope(this.k, posAlong);
+    const tvx = this.axis === 'v' ? sl * this.dir : this.dir;
+    const tvy = this.axis === 'v' ? this.dir : sl * this.dir;
     this.x += dv[0] * this.speed * dt;
     this.y += dv[1] * this.speed * dt;
     if (this.axis === 'v') this.x += latFix; else this.y += latFix;
-    this.heading = lerpAngle(this.heading, headingOf(dv[0], dv[1]), Math.min(1, 8 * dt));
+    this.heading = lerpAngle(this.heading, headingOf(tvx, tvy), Math.min(1, 8 * dt));
   }
 
   beginTurn(env, crossC, jn) {
@@ -362,18 +383,16 @@ export class AICar {
       : [dv[1], -dv[0]];
     let exit, ctrl, nk, naxis, ndir;
     if (this.axis === 'v') {
-      naxis = 'h'; ndir = nd[0];
-      nk = jn;
-      const vc = world.vA.center(this.k);
-      const laneY = crossC + ndir * LANE;
-      exit = [vc + ndir * (ROAD_HALF + 4), laneY];
+      naxis = 'h'; ndir = nd[0]; nk = jn;
+      const myC = world.vA.centerAt(this.k, crossC);            // our x at the crossing
+      const laneY = crossC + ndir * laneOff(world.hA, nk, 0, this.bike);
+      exit = [myC + ndir * (world.vA.half(this.k) + 4), laneY];
       ctrl = [this.x, laneY];
     } else {
-      naxis = 'v'; ndir = nd[1];
-      nk = jn;
-      const hc = world.hA.center(this.k);
-      const laneX = crossC - ndir * LANE;
-      exit = [laneX, hc + ndir * (ROAD_HALF + 4)];
+      naxis = 'v'; ndir = nd[1]; nk = jn;
+      const myC = world.hA.centerAt(this.k, crossC);
+      const laneX = crossC - ndir * laneOff(world.vA, nk, 0, this.bike);
+      exit = [laneX, myC + ndir * (world.hA.half(this.k) + 4)];
       ctrl = [laneX, this.y];
     }
     const p0 = [this.x, this.y];
@@ -382,13 +401,63 @@ export class AICar {
     this.mode = 'turn';
   }
 
+  // Roundabout: circulate around the central island (keeping it on the left)
+  // and peel off at the leg picked by `action`. Legs sit every 90°, so a
+  // quarter/half/three-quarter arc always lands squarely on a real road.
+  beginRound(rb, vi, hj) {
+    const cx = rb.cx, cy = rb.cy;
+    const r = (rb.rIn + rb.rOut) / 2;
+    const ang = Math.atan2(this.y - cy, this.x - cx);
+    // circulation sign: whichever tangent direction agrees with our heading
+    const fwd = [Math.sin(this.heading), -Math.cos(this.heading)];
+    const tanCCW = [-Math.sin(ang), Math.cos(ang)];
+    const sign = (fwd[0] * tanCCW[0] + fwd[1] * tanCCW[1]) >= 0 ? 1 : -1;
+    const arc = this.action === 'right' ? Math.PI / 2 : this.action === 'left' ? Math.PI * 1.5 : Math.PI;
+    this.round = { cx, cy, r, ang, sign, arc, done: 0, vi, hj };
+    this.mode = 'round';
+  }
+
+  updateRound(dt, env) {
+    const rd = this.round;
+    this.speed = Math.max(26, Math.min(this.speed, 52));       // slow, steady yield speed
+    const step = this.speed * dt / rd.r;                        // radians this frame
+    rd.ang += rd.sign * step;
+    rd.done += step;
+    this.x = rd.cx + Math.cos(rd.ang) * rd.r;
+    this.y = rd.cy + Math.sin(rd.ang) * rd.r;
+    // tangent heading in the direction of travel
+    const tx = -Math.sin(rd.ang) * rd.sign, ty = Math.cos(rd.ang) * rd.sign;
+    this.heading = lerpAngle(this.heading, headingOf(tx, ty), Math.min(1, 10 * dt));
+    if (rd.done < rd.arc) return;
+
+    // reached the exit leg: snap to the nearest cardinal and drive out
+    const world = env.world;
+    const a = ((rd.ang % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    const quad = Math.round(a / (Math.PI / 2)) % 4;             // 0:E 1:S 2:W 3:N
+    let naxis, nk, ndir;
+    if (quad === 0)      { naxis = 'h'; nk = rd.hj; ndir = 1; }
+    else if (quad === 2) { naxis = 'h'; nk = rd.hj; ndir = -1; }
+    else if (quad === 1) { naxis = 'v'; nk = rd.vi; ndir = 1; }
+    else                 { naxis = 'v'; nk = rd.vi; ndir = -1; }
+    const axisN = naxis === 'v' ? world.vA : world.hA;
+    this.axis = naxis; this.k = nk; this.dir = ndir; this.laneIndex = 0;
+    const along = naxis === 'v' ? this.y : this.x;
+    const perp = naxis === 'v' ? -ndir : ndir;
+    const cen = axisN.centerAt(nk, along) + perp * laneOff(axisN, nk, 0, this.bike);
+    if (naxis === 'v') this.x = cen; else this.y = cen;
+    this.mode = 'drive';
+    this.round = null;
+    this.lastCross = undefined;
+    this.chooseAction();
+  }
+
   updateTurn(dt, env) {
     const tn = this.turn;
     this.speed = Math.max(30, this.speed - 60 * dt);
     tn.t += this.speed * dt / tn.len;
     if (tn.t >= 1) {
       this.x = tn.exit[0]; this.y = tn.exit[1];
-      this.axis = tn.naxis; this.k = tn.nk; this.dir = tn.ndir;
+      this.axis = tn.naxis; this.k = tn.nk; this.dir = tn.ndir; this.laneIndex = 0;
       this.mode = 'drive';
       this.lastCross = undefined;
       this.chooseAction();
@@ -456,15 +525,16 @@ export class AICar {
 
   realign(world) {
     const nv = world.vA.nearest(this.x), nh = world.hA.nearest(this.y);
-    const dv = Math.abs(this.x - nv.c), dh = Math.abs(this.y - nh.c);
+    const dv = Math.abs(this.x - world.vA.centerAt(nv.k, this.y));
+    const dh = Math.abs(this.y - world.hA.centerAt(nh.k, this.x));
     const f = [Math.sin(this.heading), -Math.cos(this.heading)];
-    if (dv < ROAD_HALF - 4 && dv <= dh) {
-      this.axis = 'v'; this.k = nv.k;
+    if (dv < world.vA.half(nv.k) - 4 && dv <= dh) {
+      this.axis = 'v'; this.k = nv.k; this.laneIndex = 0;
       this.dir = f[1] > 0 ? 1 : -1;
       this.mode = 'drive'; this.lastCross = undefined;
       this.chooseAction();
-    } else if (dh < ROAD_HALF - 4) {
-      this.axis = 'h'; this.k = nh.k;
+    } else if (dh < world.hA.half(nh.k) - 4) {
+      this.axis = 'h'; this.k = nh.k; this.laneIndex = 0;
       this.dir = f[0] > 0 ? 1 : -1;
       this.mode = 'drive'; this.lastCross = undefined;
       this.chooseAction();
@@ -796,8 +866,9 @@ export class Traffic {
       const dir = -side;                                // heading back toward the player
       const perp = useV ? -dir : dir;
       const posAlong = along + side * dist;
-      const x = useV ? roadC + perp * LANE : posAlong;
-      const y = useV ? posAlong : roadC + perp * LANE;
+      const cen = axisA.centerAt(k, posAlong) + perp * laneOff(axisA, k, 0, false);
+      const x = useV ? cen : posAlong;
+      const y = useV ? posAlong : cen;
       if (Math.hypot(x - player.x, y - player.y) < 300) continue; // must be off-screen
       let blocked = false;
       for (const c of this.cars) if (Math.hypot(c.x - x, c.y - y) < 40) { blocked = true; break; }
@@ -855,10 +926,12 @@ export class Traffic {
       const side = Math.random() < 0.5 ? 1 : -1;
       const posAlong = along + side * dist;
       const kind = pickType(Math.random());
-      const off = kind === 'bike' ? BIKE_LANE : LANE;
+      const bike = kind === 'bike';
+      const li = bike ? 0 : Math.floor(Math.random() * axisA.lanes(k)); // pick a lane
       const perp = useV ? -dir : dir;
-      const x = useV ? roadC + perp * off : posAlong;
-      const y = useV ? posAlong : roadC + perp * off;
+      const cen = axisA.centerAt(k, posAlong) + perp * laneOff(axisA, k, li, bike);
+      const x = useV ? cen : posAlong;
+      const y = useV ? posAlong : cen;
       if (Math.hypot(x - player.x, y - player.y) < 240) continue;
       let blocked = false;
       for (const c of this.cars) {
@@ -867,7 +940,7 @@ export class Traffic {
       if (blocked) continue;
       const dv = useV ? [0, dir] : [dir, 0];
       const car = new AICar(x, y, {
-        axis: useV ? 'v' : 'h', k, dir,
+        axis: useV ? 'v' : 'h', k, dir, laneIndex: li,
         heading: headingOf(dv[0], dv[1]), kind,
       });
       car.speed = car.cruise * 0.7;

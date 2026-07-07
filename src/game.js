@@ -1,7 +1,7 @@
 // Game orchestration: menu / play / dead states, camera with trauma shake,
 // HUD (damage meter + speedometer), and the per-frame update/render loop.
 
-import { World, ROAD_HALF } from './world.js';
+import { World } from './world.js';
 import { PlayerCar, CarBody, VEHICLES, VEHICLE_KEYS } from './car.js';
 import { Traffic } from './traffic.js';
 import { Pedestrians } from './pedestrians.js';
@@ -146,6 +146,7 @@ export class Game {
     this._wrongClear = true;
     this._interId = null;
     this.deathT = 0;
+    this.sound.suppressed = false;
     this.state = 'play';
   }
 
@@ -281,7 +282,9 @@ export class Game {
     // running a red: count when you first enter an intersection box whose
     // signal (for your direction of travel) is red
     const vi = this.world.vA.nearest(p.x), hj = this.world.hA.nearest(p.y);
-    const inBox = Math.abs(p.x - vi.c) < ROAD_HALF + 3 && Math.abs(p.y - hj.c) < ROAD_HALF + 3;
+    const vcx = this.world.vA.centerAt(vi.k, p.y), hcy = this.world.hA.centerAt(hj.k, p.x);
+    const vHalf = this.world.vA.half(vi.k), hHalf = this.world.hA.half(hj.k);
+    const inBox = Math.abs(p.x - vcx) < vHalf + 3 && Math.abs(p.y - hcy) < hHalf + 3;
     if (!inBox) {
       this._interId = null;
     } else {
@@ -300,14 +303,14 @@ export class Game {
     // right, so the signed offset from road center must oppose your heading on
     // a vertical road and match it on a horizontal one. Only checked while
     // clearly driving down a lane — never at an intersection or off the road.
-    const dxv = p.x - vi.c, dyh = p.y - hj.c;
+    const dxv = p.x - vcx, dyh = p.y - hcy;
     const movingNS = Math.abs(p.vy) >= Math.abs(p.vx);
     let onWrong = false, onCorrect = false;
     if (mph > 8 && !inBox) {
-      if (movingNS && Math.abs(dxv) < ROAD_HALF && Math.abs(dxv) > 3) {
+      if (movingNS && Math.abs(dxv) < vHalf && Math.abs(dxv) > 3) {
         const dir = Math.sign(p.vy);
         if (dir !== 0) { if (dxv * dir > 0) onWrong = true; else onCorrect = true; }
-      } else if (!movingNS && Math.abs(dyh) < ROAD_HALF && Math.abs(dyh) > 3) {
+      } else if (!movingNS && Math.abs(dyh) < hHalf && Math.abs(dyh) > 3) {
         const dir = Math.sign(p.vx);
         if (dir !== 0) { if (dyh * dir < 0) onWrong = true; else onCorrect = true; }
       }
@@ -321,26 +324,34 @@ export class Game {
 
   updateDead(dt) {
     this.deathT += dt;
-    const env = {
-      world: this.world, particles: this.particles, sound: this.sound,
-      camera: this.camera, stats: this.stats, player: this.player,
-      t: this.stats.t, obstacles: [],
-    };
-    this.stats.t += dt;
-    env.t = this.stats.t;
-    this.player.update(dt, this.input, env); // rolls to a stop, burns
-    this.traffic.update(dt, env);
-    this.pedestrians.update(dt, env);
-    this.particles.update(dt);
-    this.updateEmitters(dt);
-    this.camera.update(dt, this.player);
-    this.sound.setListener(this.player.x, this.player.y);
+    // dead = silent: kill the engine/skid/siren and gag every one-shot effect
+    this.sound.suppressed = true;
     this.sound.setEngine(0, false);
     this.sound.setSkid(0);
     this.sound.setSiren(0);
 
+    // the wreck keeps burning and the city keeps moving for a while, then the
+    // whole world freezes (you can still restart with R or bail with Esc)
+    if (this.deathT < 15) {
+      const env = {
+        world: this.world, particles: this.particles, sound: this.sound,
+        camera: this.camera, stats: this.stats, player: this.player,
+        t: this.stats.t, obstacles: [],
+      };
+      this.stats.t += dt;
+      env.t = this.stats.t;
+      this.player.update(dt, this.input, env); // rolls to a stop, burns
+      this.traffic.update(dt, env);
+      this.pedestrians.update(dt, env);
+      this.particles.update(dt);
+      this.updateEmitters(dt);
+      this.camera.update(dt, this.player);
+      this.sound.setListener(this.player.x, this.player.y);
+    }
+
     if (this.deathT > 1 && this.input.pressed('KeyR')) this.startRun();
     if (this.input.pressed('Escape')) {
+      this.sound.suppressed = false;
       this.state = 'menu';
       this.buildMenuWorld();
     }
