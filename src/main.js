@@ -5,6 +5,8 @@ const canvas = document.getElementById('game');
 const game = new Game(canvas);
 window.__game = game; // debugging handle
 
+window.addEventListener('resize', () => game.resize());
+
 initTuner(); // live handling sliders (loads saved tuning from localStorage)
 
 let last = performance.now();

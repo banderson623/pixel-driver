@@ -11,10 +11,19 @@ import { Sound } from './audio.js';
 import { hashStr } from './rng.js';
 import { drawText, drawTextCentered, textWidth } from './font.js';
 
-export const W = 400, H = 300;
+// Internal render resolution (world units). W/H track the browser window,
+// divided by PIXEL so the pixel-art stays chunky at a constant density.
+// They're `let` because resize() reassigns them; nothing imports them by name
+// (other modules receive them as draw() parameters), so the live binding is safe.
+export let W = 400, H = 300;
+const PIXEL = 2; // rendered screen pixels per world pixel
 
 // City speed limit (mph). Exceeding it in Rap Sheet mode is an infraction.
 const SPEED_LIMIT = 40;
+
+// Chase score: points earned per second for each cop car actively pursuing you.
+// Keep more cruisers on your tail longer and the bounty climbs faster.
+const CHASE_RATE = 10;
 
 // Selectable game modes. 'cruise' is the original drive-till-totaled sandbox;
 // 'rapsheet' layers a live tally of traffic infractions on top.
@@ -72,6 +81,7 @@ export class Game {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.ctx.imageSmoothingEnabled = false;
+    this.resize();
     this.input = new Input();
     this.sound = new Sound();
     this.state = 'menu';
@@ -90,6 +100,18 @@ export class Game {
 
     window.addEventListener('keydown', () => this.sound.ensure(), { once: false });
     window.addEventListener('pointerdown', () => this.sound.ensure());
+  }
+
+  // Size the render buffer to the browser window (÷ PIXEL keeps pixels chunky).
+  // Reassigns the module-level W/H so camera/HUD/draw all follow along. A bigger
+  // window simply reveals more of the world rather than scaling the same view up.
+  resize() {
+    W = Math.max(200, Math.round(window.innerWidth / PIXEL));
+    H = Math.max(150, Math.round(window.innerHeight / PIXEL));
+    this.canvas.width = W;
+    this.canvas.height = H;
+    // Resetting the buffer size clears context state, so re-disable smoothing.
+    this.ctx.imageSmoothingEnabled = false;
   }
 
   // Dev test pad: these seeds generate open pavement with no obstacles.
@@ -139,6 +161,7 @@ export class Game {
       t: 0, dist: 0, topSpeed: 0, carsHit: 0, propsSmashed: 0,
       cellsDestroyed: 0, lastHitT: -10, peds: 0,
       infractions: newInfractions(), lastInfractionT: -10, lastWreckT: -10,
+      chaseScore: 0,
     };
     // infraction edge-detector state (see trackInfractions)
     this._speeding = false;
@@ -217,6 +240,9 @@ export class Game {
     const mph = this.player.speedMph();
     this.stats.topSpeed = Math.max(this.stats.topSpeed, mph);
     this.stats.dist += this.player.speed() * dt * 0.19 / 1609; // px→m→mi
+
+    // chase score climbs the longer cops chase you — and faster the more there are
+    this.stats.chaseScore += this.traffic.pursuers() * CHASE_RATE * dt;
 
     // audio
     this.sound.setListener(this.player.x, this.player.y);
@@ -451,9 +477,9 @@ export class Game {
     const info = `SEED ${this.seedStr}  ${s.dist.toFixed(2)} MI`;
     drawText(ctx, info, W - textWidth(info, 1) - 6, 9, 1, 'rgba(255,255,255,0.55)');
 
-    // rap-sheet penalty points, shown large (top center)
+    // rap-sheet score, shown large (top center) — infractions plus chase bounty
     if (this.mode === 'rapsheet') {
-      const pts = infractionScore(s.infractions);
+      const pts = infractionScore(s.infractions) + Math.floor(s.chaseScore);
       const flash = s.t - s.lastInfractionT < 0.4;
       drawTextCentered(ctx, String(pts), W / 2, 6, 3, flash ? '#ffffff' : '#e05545');
       drawTextCentered(ctx, 'PTS', W / 2, 24, 1, flash ? '#ffffff' : '#9a9aa4');
@@ -596,7 +622,8 @@ export class Game {
     ctx.fillStyle = '#3a3a44';
     ctx.fillRect(x0, 179, x1 - x0, 1);
     drawText(ctx, 'SEVERITY', x0, 185, 1, '#ffffff');
-    const sv = String(infractionScore(inf));
+    // total score = weighted infractions + chase bounty earned over the run
+    const sv = String(infractionScore(inf) + Math.floor(this.stats.chaseScore));
     drawText(ctx, sv, x1 - textWidth(sv, 2), 183, 2, '#ffffff');
   }
 }
