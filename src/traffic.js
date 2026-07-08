@@ -26,10 +26,11 @@ const BIKE_FRAMES = ['#2a2a30', '#39424e', '#4a2f2f', '#2f4a3a'];
 
 // AI vehicle roster. len/wid drive collision footprint & drawing; mass makes
 // the big rigs shove the player around; hp sets how much abuse they take.
+// Motorcycles are pedestrian-class: barely any weight, and one hit ends them.
 const TYPES = {
   car:        { len: 24, wid: 13, cruiseLo: 55, cruiseHi: 90,  mass: 1, hpLo: 55,  hpHi: 85 },
   police:     { len: 24, wid: 13, cruiseLo: 62, cruiseHi: 96,  mass: 1, hpLo: 190, hpHi: 215 },
-  motorcycle: { len: 14, wid: 5,  cruiseLo: 62, cruiseHi: 104, mass: 1, hpLo: 10,  hpHi: 18 },
+  motorcycle: { len: 14, wid: 5,  cruiseLo: 62, cruiseHi: 104, mass: 0.25, hpLo: 2, hpHi: 5 },
   schoolbus:  { len: 46, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 8,  hpLo: 150, hpHi: 210 },
   citybus:    { len: 48, wid: 14, cruiseLo: 40, cruiseHi: 56,  mass: 8,  hpLo: 150, hpHi: 210 },
   dumptruck:  { len: 34, wid: 15, cruiseLo: 46, cruiseHi: 66,  mass: 7,  hpLo: 160, hpHi: 220 },
@@ -90,6 +91,8 @@ export class AICar {
     this.speed = 0;
     this.vx = 0; this.vy = 0;
     this.spinv = 0;
+    this.dodge = 0;   // lateral evasive offset from the lane centre
+    this.bypass = 0; this.bypassTarget = null; this.waitT = 0; // dead-blocker overtake
     this.shoveT = 0;
     this.action = 'straight';
     this.turn = null;
@@ -133,8 +136,9 @@ export class AICar {
       this.chaseT = 0;   // time spent in active pursuit — feeds desperation
     }
     // every motor vehicle goes up in a fireball (with splash damage) when
-    // destroyed; only pedal bikes just crumple
-    this.canExplode = this.type !== 'bike';
+    // destroyed; two-wheelers (pedal bikes and motorcycles) just crumple —
+    // a motorcycle is basically a pedestrian with an engine
+    this.canExplode = this.type !== 'bike' && this.type !== 'motorcycle';
   }
 
   // Blast strength when destroyed — scales with the vehicle's weight and
@@ -175,7 +179,13 @@ export class AICar {
     // and slams into you instead of trailing behind
     const dist = Math.hypot(player.x - this.x, player.y - this.y) || 1;
     const lead = Math.min(0.55, dist / 320);
-    const tx = player.x + player.vx * lead, ty = player.y + player.vy * lead;
+    // each cruiser aims at its own flank of the target, so a pack spreads out
+    // instead of piling onto one point; the offset collapses to a pure ram as
+    // it closes in
+    const flank = ((this.id % 5) - 2) * 15 * Math.min(1, Math.max(0, (dist - 70) / 140));
+    const pdx = (player.x - this.x) / dist, pdy = (player.y - this.y) / dist;
+    const tx = player.x + player.vx * lead - pdy * flank;
+    const ty = player.y + player.vy * lead + pdx * flank;
     const dx = tx - this.x, dy = ty - this.y;
     let desired = headingOf(dx, dy);
 
@@ -214,12 +224,24 @@ export class AICar {
       }
       return look + 1;
     };
-    const cC = clearDist(0), cL = clearDist(-0.55), cR = clearDist(0.55);
-    const nearest = Math.min(cC, cL, cR);
+    // five whiskers: a centre cone decides "blocked", wide feelers tell us
+    // which side actually has room
+    const cC = clearDist(0), cL1 = clearDist(-0.3), cR1 = clearDist(0.3);
+    const cL = Math.max(cL1, clearDist(-0.65)), cR = Math.max(cR1, clearDist(0.65));
+    const nearest = Math.min(cC, cL1, cR1);
     const blocked = nearest <= look;
     if (blocked) {
+      // hysteresis: stick with the side we already committed to unless the
+      // other side is clearly better — kills the frame-to-frame zigzag
+      let side = this.swerve || 0;
+      if (!side || (side < 0 ? cR > cL * 1.35 : cL > cR * 1.35)) side = cL >= cR ? -1 : 1;
+      this.swerve = side;
+      this.swerveT = 0.4;
       const strength = 0.5 + 0.7 * (1 - nearest / look);   // sharper when closer
-      desired = this.heading + (cL >= cR ? -strength : strength);
+      desired = this.heading + side * strength;
+    } else {
+      this.swerveT = (this.swerveT || 0) - dt;
+      if (this.swerveT <= 0) this.swerve = 0;
     }
 
     // steer the nose toward the target (faster when dodging, twitchier when
@@ -236,6 +258,12 @@ export class AICar {
     // off — though a desperate cop runs hotter and barely lifts for anything
     let top = this.cruise + desp * 20 + (!blocked && dist < 130 + 90 * desp ? 55 : 0);
     if (blocked) top = Math.min(top, this.cruise * Math.min(1, 0.4 + 0.5 * (nearest / look) + 0.55 * desp));
+    // corner throttle: lift in proportion to how far the nose is from where
+    // we want to go, so the cruiser arcs onto the target instead of orbiting
+    // past it at full tilt — a desperate cop lifts less and drifts more
+    let aerr = Math.abs(desired - this.heading) % (Math.PI * 2);
+    if (aerr > Math.PI) aerr = Math.PI * 2 - aerr;
+    top *= 1 - (0.45 - 0.2 * desp) * Math.min(1, aerr / 1.2);
     vf = Math.min(top, vf + 200 * dt);
     vf *= Math.exp(-0.3 * dt);
     vl *= Math.exp(-3.0 * dt);                       // grip: how fast the slide scrubs off
@@ -326,7 +354,62 @@ export class AICar {
     // perp(dx,dy) = (-dy,dx): lane center = road center + perp*laneOff
     const perp = this.axis === 'v' ? -this.dir : this.dir;
     const laneC = roadC + perp * laneOff(axisA, this.k, this.laneIndex, this.bike);
-    const latFix = (laneC - posLat) * Math.min(1, 4 * dt);
+
+    // Collision avoidance: project every nearby body's closest approach along
+    // current velocities; anything on a converging course gets a swerve (a
+    // lateral dodge away from the predicted miss point, clamped to the
+    // pavement) and, if it's dead ahead and imminent, hard braking. This is
+    // what makes traffic dive out of the player's way instead of eating the
+    // hit.
+    const mvx = dv[0] * this.speed, mvy = dv[1] * this.speed;
+    let want = 0, panic = 0;
+    for (const o of env.obstacles) {
+      if (o === this || o.exploded) continue;
+      const rx = o.x - this.x, ry = o.y - this.y;
+      if (rx * rx + ry * ry > 140 * 140) continue;
+      const ov = o.velocity ? o.velocity() : [o.vx || 0, o.vy || 0];
+      const rvx = ov[0] - mvx, rvy = ov[1] - mvy;
+      const rv2 = rvx * rvx + rvy * rvy;
+      if (rv2 < 25) continue;                          // barely converging
+      const t = -(rx * rvx + ry * rvy) / rv2;          // time of closest approach
+      if (t < 0 || t > 1.3) continue;
+      const mx = rx + rvx * t, my = ry + rvy * t;      // miss vector at that time
+      const need = (this.rad || 7) + (o.rad || 7) + 3;
+      const miss = Math.hypot(mx, my);
+      if (miss >= need) continue;
+      const u = (1 - t / 1.3) * (1 - miss / need);     // urgency 0..1
+      const latMiss = this.axis === 'v' ? mx : my;     // which side it passes on
+      want -= Math.sign(latMiss || (Math.random() - 0.5)) * 16 * u;
+      // only threats in front of us also warrant braking
+      if (rx * dv[0] + ry * dv[1] > 0) panic = Math.max(panic, u);
+    }
+    // pedestrians get the same look-ahead — they're small and near-stationary
+    // at car speeds, so this reads as "brake and edge away", not a hard swerve
+    if (env.peds) {
+      for (const p of env.peds) {
+        if (p.dead) continue;
+        const rx = p.x - this.x, ry = p.y - this.y;
+        if (rx * rx + ry * ry > 90 * 90) continue;
+        const rv2 = mvx * mvx + mvy * mvy;
+        if (rv2 < 25) continue;
+        const t = (rx * mvx + ry * mvy) / rv2;         // closest approach to a standstill target
+        if (t < 0 || t > 1.1) continue;
+        const mx = rx - mvx * t, my = ry - mvy * t;
+        const need = (this.rad || 7) + 5;
+        const miss = Math.hypot(mx, my);
+        if (miss >= need) continue;
+        const u = (1 - t / 1.1) * (1 - miss / need);
+        const latMiss = this.axis === 'v' ? mx : my;
+        want -= Math.sign(latMiss || 1) * 12 * u;
+        if (rx * dv[0] + ry * dv[1] > 0) panic = Math.max(panic, u);
+      }
+    }
+    want += this.bypass || 0;   // active blocker bypass rides the same channel
+    this.dodge += (Math.max(-24, Math.min(24, want)) - this.dodge) * Math.min(1, 5 * dt);
+    const maxLat = axisA.half(this.k) - (this.rad || 4);
+    const latT = Math.max(roadC - maxLat, Math.min(roadC + maxLat, laneC + this.dodge));
+    // swerves pull to the target faster than routine lane keeping
+    const latFix = (latT - posLat) * Math.min(1, (4 + 4 * Math.abs(this.dodge) / 16) * dt);
 
     // next crossing road
     const j = axisB.locate(posAlong);
@@ -336,60 +419,175 @@ export class AICar {
     const stopAt = crossC - this.dir * (crossHalf + 16);
     const dStop = (stopAt - posAlong) * this.dir;
 
-    // roundabout dead ahead → circulate instead of crossing/turning
+    // roundabout dead ahead → yield at the rim to circulating traffic, then
+    // circulate instead of crossing/turning
     const rvi = this.axis === 'v' ? this.k : jn;
     const rhj = this.axis === 'v' ? jn : this.k;
     const rb = world.roundabout(rvi, rhj);
-    if (rb && Math.hypot(this.x - rb.cx, this.y - rb.cy) < rb.rOut + 3) {
-      this.beginRound(rb, rvi, rhj);
-      return;
+    let yieldTs = Infinity;
+    if (rb) {
+      const dc = Math.hypot(this.x - rb.cx, this.y - rb.cy);
+      let busy = false;
+      if (dc < rb.rOut + 30) {
+        for (const o of env.obstacles) {
+          if (o === this || o.mode !== 'round') continue;
+          if (Math.hypot(o.x - this.x, o.y - this.y) < 50) { busy = true; break; }
+        }
+      }
+      if (dc < rb.rOut + 3 && !busy) { this.beginRound(rb, rvi, rhj); return; }
+      if (busy) yieldTs = Math.max(0, (dc - rb.rOut + 2) * 1.8);
     }
 
     let ts = this.cruise * axisA.speedMul(this.k);       // highways run faster
+    if (yieldTs < Infinity) ts = Math.min(ts, yieldTs);
 
-    // traffic light
+    // traffic light: brake from actual physics — start slowing once the stop
+    // line enters our braking envelope, and only run a yellow when we
+    // genuinely can't stop any more
     const vi = this.axis === 'v' ? this.k : jn;
     const hj = this.axis === 'v' ? jn : this.k;
-    if (world.hasLight(vi, hj) && dStop > -2 && dStop < 95) {
-      const ph = world.lightPhase(vi, hj, env.t);
-      const st = this.axis === 'v' ? ph.ns : ph.ew;
-      if (st === 'r' || (st === 'y' && dStop > 28)) {
-        ts = Math.min(ts, Math.max(0, dStop) * 1.7);
-        if (dStop < 3) ts = 0;
+    if (world.hasLight(vi, hj) && dStop > -2) {
+      const brakeD = this.speed * this.speed / (2 * 110) + 8;
+      if (dStop < Math.max(60, brakeD + 30)) {
+        const ph = world.lightPhase(vi, hj, env.t);
+        const st = this.axis === 'v' ? ph.ns : ph.ew;
+        if (st === 'r' || (st === 'y' && dStop > brakeD * 0.8)) {
+          // constant-decel speed profile down to the line
+          ts = Math.min(ts, Math.sqrt(Math.max(0, dStop - 3) * 2 * 110));
+          if (dStop < 3) ts = 0;
+        }
       }
     }
 
-    // obstacle probe (cars + player ahead)
-    const probe = 16 + this.speed * 0.6;
-    const pax = this.x + dv[0] * probe, pay = this.y + dv[1] * probe;
-    let blocked = false, copAhead = false;
-    for (const o of env.obstacles) {
-      if (o === this) continue;
-      const ddx = o.x - pax, ddy = o.y - pay;
-      if (ddx * ddx + ddy * ddy < 16 * 16) {
-        const dd = Math.hypot(o.x - this.x, o.y - this.y);
-        ts = Math.min(ts, Math.max(0, (dd - 22) * 1.6));
-      }
-      const cdx = o.x - this.x, cdy = o.y - this.y;
-      if (cdx * dv[0] + cdy * dv[1] > 0 && cdx * cdx + cdy * cdy < 24 * 24) {
-        ts = Math.min(ts, 6); blocked = true;
-        if (o.police) copAhead = true;
+    // unsignalled crossings: right-of-way — a local road yields to a highway,
+    // and on equal-rank roads vertical yields to horizontal (a deterministic
+    // tiebreak, so nobody T-bones and nobody deadlocks). Hold at the line
+    // while anything with priority is bearing down on the intersection.
+    const myHwy = axisA.meta(this.k).hwy, crossHwy = axisB.meta(jn).hwy;
+    const mustYield = (crossHwy && !myHwy) || (crossHwy === myHwy && this.axis === 'v');
+    if (!rb && mustYield && dStop > -2 && dStop < 70 && !world.hasLight(vi, hj)) {
+      const ix = this.axis === 'v' ? axisA.centerAt(this.k, crossC) : crossC;
+      const iy = this.axis === 'v' ? crossC : axisA.centerAt(this.k, crossC);
+      for (const o of env.obstacles) {
+        if (o === this) continue;
+        const ov = o.velocity ? o.velocity() : [o.vx || 0, o.vy || 0];
+        const os = Math.hypot(ov[0], ov[1]);
+        if (os < 25) continue;
+        const dxi = ix - o.x, dyi = iy - o.y;
+        const di = Math.hypot(dxi, dyi) || 1;
+        if (di > 170) continue;
+        if ((ov[0] * dxi + ov[1] * dyi) / (os * di) < 0.7) continue;    // not heading here
+        if (Math.abs(ov[0] * dv[0] + ov[1] * dv[1]) > os * 0.7) continue; // parallel → not cross traffic
+        ts = Math.min(ts, Math.max(0, dStop) * 1.7);
+        if (dStop < 3) ts = 0;
+        break;
       }
     }
+
+    // car-following, in the lane frame: only things roughly in our own lane
+    // ahead matter, and we track the leader's speed at a speed-scaled gap.
+    // (The old isotropic point-probe phantom-braked for the adjacent highway
+    // lane and for close oncoming passes.)
+    let blocked = false, copAhead = false, lead = null, leadAlong = 0, leadSpeed = 0;
+    for (const o of env.obstacles) {
+      if (o === this || o.exploded) continue;
+      const cdx = o.x - this.x, cdy = o.y - this.y;
+      const along = cdx * dv[0] + cdy * dv[1];
+      if (along <= 0 || along > 30 + this.speed * 1.2) continue;
+      const lat = (this.axis === 'v' ? o.x : o.y) - latT;  // vs where we're steering
+      if (Math.abs(lat) > (this.rad || 7) + (o.rad || 7) + 2) continue;
+      if (lead === null || along < leadAlong) {
+        lead = o; leadAlong = along;
+        const ov = o.velocity ? o.velocity() : [o.vx || 0, o.vy || 0];
+        leadSpeed = Math.max(0, ov[0] * dv[0] + ov[1] * dv[1]);
+      }
+    }
+    if (lead) {
+      const gap = (this.half || 12) + (lead.half || 12) + 6 + this.speed * 0.25; // headway
+      let follow = Math.max(0, leadSpeed + (leadAlong - gap) * 2.0);
+      if (lead === this.bypassTarget) follow = Math.max(follow, 14);  // nose past the blocker
+      ts = Math.min(ts, follow);
+      if (leadAlong < gap + 6 && leadSpeed < 12) {
+        blocked = true;
+        if (lead.police) copAhead = true;
+      }
+    }
+    // a lead that will never move (wreck, stranded or parked car) — or a
+    // dawdling cyclist — can't be waited out. TTCA avoidance is blind to it
+    // once we've stopped (nothing converges), so after a patient pause feed a
+    // steady offset into the dodge channel and slip around.
+    if (this.bypassTarget) {
+      const b = this.bypassTarget;
+      const along = (b.x - this.x) * dv[0] + (b.y - this.y) * dv[1];
+      if (along < -((b.half || 12) + 6) || along > 120) {   // passed it (or it drove off)
+        this.bypassTarget = null; this.bypass = 0; this.waitT = 0;
+      }
+    } else {
+      const stuckLead = lead && (leadSpeed < 2
+        ? (lead.mode === 'wreck' || lead.mode === 'idle' || lead.mode === 'parked' || lead.exploded)
+        : (lead.bike === true && ts < this.cruise * 0.55));
+      this.waitT = stuckLead ? (this.waitT || 0) + dt : 0;
+      if (this.waitT > 2.2) {
+        this.bypassTarget = lead;
+        const latLead = (this.axis === 'v' ? lead.x : lead.y) - roadC;
+        this.bypass = latLead >= posLat - roadC ? -24 : 24; // pass on the freer side
+        this.waitT = 0;
+      }
+    }
+    // stuck behind someone slow on a multi-lane road → change lanes when the
+    // target lane is clear alongside and behind
+    if (lead && ts < this.cruise * 0.5 && axisA.lanes(this.k) > 1) {
+      this.stuckT = (this.stuckT || 0) + dt;
+      if (this.stuckT > 1.3) {
+        this.stuckT = 0.6;   // re-check soon, not every frame
+        const cand = [];
+        if (this.laneIndex > 0) cand.push(this.laneIndex - 1);
+        if (this.laneIndex < axisA.lanes(this.k) - 1) cand.push(this.laneIndex + 1);
+        for (const li of cand) {
+          const c2 = roadC + perp * laneOff(axisA, this.k, li, this.bike);
+          let clear = true;
+          for (const o of env.obstacles) {
+            if (o === this || o.exploded) continue;
+            const along = (o.x - this.x) * dv[0] + (o.y - this.y) * dv[1];
+            if (along < -30 || along > 60) continue;
+            if (Math.abs((this.axis === 'v' ? o.x : o.y) - c2) < 16) { clear = false; break; }
+          }
+          if (clear) { this.laneIndex = li; this.stuckT = 0; break; }
+        }
+      }
+    } else this.stuckT = 0;
+    // panic braking on top of the swerve when a collision is imminent ahead
+    if (panic > 0.25) ts = Math.min(ts, this.cruise * (1 - panic));
     // lay on the horn when something's stopped in front of you (city ambiance)
-    // — but cops have sirens, not horns, and nobody honks at a cop
-    if (blocked && !copAhead && !this.police && this.honkT <= 0 && env.sound) {
+    // — but cops have sirens, not horns, and nobody honks at a cop; a hard
+    // dodge also gets an angry honk
+    if (((blocked && !copAhead) || panic > 0.55) && !this.police && this.honkT <= 0 && env.sound) {
       const dp = Math.hypot(this.x - env.player.x, this.y - env.player.y);
       if (dp < 320 && Math.random() < 0.5) { env.sound.honk(this.x, this.y); this.honkT = 1.6 + Math.random() * 2.6; }
     }
 
-    if (this.speed < ts) this.speed = Math.min(ts, this.speed + 75 * dt);
-    else this.speed = Math.max(ts, this.speed - 170 * dt);
-
-    // begin a turn?
+    // a left turn crosses the oncoming lane: hold short of the box for a gap
     const entry = crossC - this.dir * (crossHalf + 2);
     const dEntry = (entry - posAlong) * this.dir;
-    if (this.action !== 'straight' && dEntry <= 1 && dEntry > -10 && this.speed > 4) {
+    const waitLeft = this.action === 'left' && dEntry > -10 && dEntry < 40 &&
+      this.oncomingBlocks(env, dv);
+    if (waitLeft) {
+      ts = Math.min(ts, Math.max(0, dEntry - 2) * 1.7);
+      if (dEntry < 3) ts = 0;
+    }
+
+    // eased throttle: soft rolloff approaching the target, gentle trims but
+    // hard stops when braking — kills the lockstep surge-and-slam
+    if (this.speed < ts) {
+      const a = 45 + 60 * Math.min(1, (ts - this.speed) / 25);
+      this.speed = Math.min(ts, this.speed + a * dt);
+    } else {
+      const d = 50 + Math.min(170, (this.speed - ts) * 5);
+      this.speed = Math.max(ts, this.speed - d * dt);
+    }
+
+    // begin a turn?
+    if (this.action !== 'straight' && dEntry <= 1 && dEntry > -10 && this.speed > 4 && !waitLeft) {
       this.beginTurn(env, crossC, jn);
       return;
     }
@@ -399,15 +597,47 @@ export class AICar {
       this.chooseAction();
     }
 
-    // advance along the (possibly curved) road: heading tracks the local
-    // tangent so cars lean into curves instead of crabbing straight
+    // advance along the (possibly curved) road: move along the local tangent
+    // — not the raw axis — so the body follows the bend instead of crabbing
+    // and letting the lane-keeper drag it sideways
     const sl = axisA.slope(this.k, posAlong);
     const tvx = this.axis === 'v' ? sl * this.dir : this.dir;
     const tvy = this.axis === 'v' ? this.dir : sl * this.dir;
-    this.x += dv[0] * this.speed * dt;
-    this.y += dv[1] * this.speed * dt;
+    const tl = Math.hypot(tvx, tvy);
+    this.x += (tvx / tl) * this.speed * dt;
+    this.y += (tvy / tl) * this.speed * dt;
     if (this.axis === 'v') this.x += latFix; else this.y += latFix;
     this.heading = lerpAngle(this.heading, headingOf(tvx, tvy), Math.min(1, 8 * dt));
+  }
+
+  // Any oncoming vehicle on our road close enough that turning left across
+  // its lane would cut it off?
+  oncomingBlocks(env, dv) {
+    for (const o of env.obstacles) {
+      if (o === this || o.exploded) continue;
+      const cdx = o.x - this.x, cdy = o.y - this.y;
+      const along = cdx * dv[0] + cdy * dv[1];
+      if (along < 6 || along > 130) continue;
+      if (Math.abs(this.axis === 'v' ? cdx : cdy) > 46) continue;  // not on our road
+      const ov = o.velocity ? o.velocity() : [o.vx || 0, o.vy || 0];
+      if (ov[0] * dv[0] + ov[1] * dv[1] < -20) return true;        // closing head-on
+    }
+    return false;
+  }
+
+  // Someone directly off the nose (used mid-turn/roundabout, where there is
+  // no lane frame to reason in).
+  maneuverBlocked(env) {
+    const f = [Math.sin(this.heading), -Math.cos(this.heading)];
+    const rgt = [Math.cos(this.heading), Math.sin(this.heading)];
+    for (const o of env.obstacles) {
+      if (o === this || o.exploded) continue;
+      const dx = o.x - this.x, dy = o.y - this.y;
+      const along = dx * f[0] + dy * f[1];
+      if (along <= 0 || along > (this.half || 12) + (o.half || 12) + 12) continue;
+      if (Math.abs(dx * rgt[0] + dy * rgt[1]) < (this.rad || 7) + (o.rad || 7) + 2) return true;
+    }
+    return false;
   }
 
   beginTurn(env, crossC, jn) {
@@ -417,23 +647,25 @@ export class AICar {
     const nd = this.action === 'right'
       ? [-dv[1], dv[0]]
       : [dv[1], -dv[0]];
-    let exit, ctrl, nk, naxis, ndir;
+    let exit, ctrl, nk, naxis, ndir, nli;
     if (this.axis === 'v') {
       naxis = 'h'; ndir = nd[0]; nk = jn;
+      nli = Math.floor(Math.random() * world.hA.lanes(nk));     // pick an exit lane
       const myC = world.vA.centerAt(this.k, crossC);            // our x at the crossing
-      const laneY = crossC + ndir * laneOff(world.hA, nk, 0, this.bike);
+      const laneY = crossC + ndir * laneOff(world.hA, nk, nli, this.bike);
       exit = [myC + ndir * (world.vA.half(this.k) + 4), laneY];
       ctrl = [this.x, laneY];
     } else {
       naxis = 'v'; ndir = nd[1]; nk = jn;
+      nli = Math.floor(Math.random() * world.vA.lanes(nk));
       const myC = world.hA.centerAt(this.k, crossC);
-      const laneX = crossC - ndir * laneOff(world.vA, nk, 0, this.bike);
+      const laneX = crossC - ndir * laneOff(world.vA, nk, nli, this.bike);
       exit = [laneX, myC + ndir * (world.hA.half(this.k) + 4)];
       ctrl = [laneX, this.y];
     }
     const p0 = [this.x, this.y];
     const len = 0.85 * (Math.hypot(ctrl[0] - p0[0], ctrl[1] - p0[1]) + Math.hypot(exit[0] - ctrl[0], exit[1] - ctrl[1]));
-    this.turn = { p0, ctrl, exit, t: 0, len: Math.max(10, len), naxis, nk, ndir };
+    this.turn = { p0, ctrl, exit, t: 0, len: Math.max(10, len), naxis, nk, ndir, nli };
     this.mode = 'turn';
   }
 
@@ -455,7 +687,14 @@ export class AICar {
 
   updateRound(dt, env) {
     const rd = this.round;
-    this.speed = Math.max(26, Math.min(this.speed, 52));       // slow, steady yield speed
+    // same patience pattern as turns: hold for a blocker, else settle to a
+    // steady circulating pace instead of snapping to a speed floor
+    const held = this.maneuverBlocked(env);
+    this.stallT = held ? (this.stallT || 0) + dt : 0;
+    const target = held && this.stallT < 2.5 ? 0 : Math.min(46, Math.max(26, this.cruise));
+    const rate = target < this.speed ? (target === 0 ? 210 : 70) : 55;
+    this.speed += Math.max(-rate * dt, Math.min(rate * dt, target - this.speed));
+    if (this.speed <= 0.1) return;
     const step = this.speed * dt / rd.r;                        // radians this frame
     rd.ang += rd.sign * step;
     rd.done += step;
@@ -476,11 +715,10 @@ export class AICar {
     else if (quad === 1) { naxis = 'v'; nk = rd.vi; ndir = 1; }
     else                 { naxis = 'v'; nk = rd.vi; ndir = -1; }
     const axisN = naxis === 'v' ? world.vA : world.hA;
-    this.axis = naxis; this.k = nk; this.dir = ndir; this.laneIndex = 0;
-    const along = naxis === 'v' ? this.y : this.x;
-    const perp = naxis === 'v' ? -ndir : ndir;
-    const cen = axisN.centerAt(nk, along) + perp * laneOff(axisN, nk, 0, this.bike);
-    if (naxis === 'v') this.x = cen; else this.y = cen;
+    this.axis = naxis; this.k = nk; this.dir = ndir;
+    this.laneIndex = Math.floor(Math.random() * axisN.lanes(nk));
+    // no lateral snap: the lane-keeper reels us onto the lane centre over the
+    // next half second instead of teleporting sideways at the exit
     this.mode = 'drive';
     this.round = null;
     this.lastCross = undefined;
@@ -489,11 +727,18 @@ export class AICar {
 
   updateTurn(dt, env) {
     const tn = this.turn;
-    this.speed = Math.max(30, this.speed - 60 * dt);
+    // hold for anyone blocking the arc (with a patience timer so two turners
+    // can't deadlock forever), otherwise settle smoothly onto cornering pace
+    const held = this.maneuverBlocked(env);
+    this.stallT = held ? (this.stallT || 0) + dt : 0;
+    const target = held && this.stallT < 2.5 ? 0 : 32;
+    const rate = target < this.speed ? (target === 0 ? 210 : 70) : 60;
+    this.speed += Math.max(-rate * dt, Math.min(rate * dt, target - this.speed));
+    if (this.speed <= 0.1) return;
     tn.t += this.speed * dt / tn.len;
     if (tn.t >= 1) {
       this.x = tn.exit[0]; this.y = tn.exit[1];
-      this.axis = tn.naxis; this.k = tn.nk; this.dir = tn.ndir; this.laneIndex = 0;
+      this.axis = tn.naxis; this.k = tn.nk; this.dir = tn.ndir; this.laneIndex = tn.nli || 0;
       this.mode = 'drive';
       this.lastCross = undefined;
       this.chooseAction();
@@ -510,6 +755,12 @@ export class AICar {
     this.y += this.vy * dt;
     this.vx *= Math.exp(-2.1 * dt);
     this.vy *= Math.exp(-2.1 * dt);
+    // soft ground bogs a sliding car just like it bogs everything else
+    const sdrag = env.world.surfaceDrag(this.x, this.y);
+    if (sdrag > 1.05) {
+      const f2 = Math.exp(-(sdrag - 1) * 1.4 * dt);
+      this.vx *= f2; this.vy *= f2;
+    }
     this.heading += this.spinv * dt;
     this.spinv *= Math.exp(-2.5 * dt);
     this.shoveT -= dt;
@@ -564,19 +815,39 @@ export class AICar {
     const dv = Math.abs(this.x - world.vA.centerAt(nv.k, this.y));
     const dh = Math.abs(this.y - world.hA.centerAt(nh.k, this.x));
     const f = [Math.sin(this.heading), -Math.cos(this.heading)];
+    // resume from the residual slide (projected onto the new direction of
+    // travel), in whichever lane we actually landed in — not the stale
+    // pre-hit cruise speed and a hard cut across to lane 0
+    const resume = (axis, k, dir) => {
+      this.axis = axis; this.k = k; this.dir = dir;
+      this.laneIndex = this.nearestLane(world, axis, k, dir);
+      const ndv = axis === 'v' ? [0, dir] : [dir, 0];
+      this.speed = Math.max(0, this.vx * ndv[0] + this.vy * ndv[1]);
+      this.mode = 'drive'; this.lastCross = undefined;
+      this.chooseAction();
+    };
     if (dv < world.vA.half(nv.k) - 4 && dv <= dh) {
-      this.axis = 'v'; this.k = nv.k; this.laneIndex = 0;
-      this.dir = f[1] > 0 ? 1 : -1;
-      this.mode = 'drive'; this.lastCross = undefined;
-      this.chooseAction();
+      resume('v', nv.k, f[1] > 0 ? 1 : -1);
     } else if (dh < world.hA.half(nh.k) - 4) {
-      this.axis = 'h'; this.k = nh.k; this.laneIndex = 0;
-      this.dir = f[0] > 0 ? 1 : -1;
-      this.mode = 'drive'; this.lastCross = undefined;
-      this.chooseAction();
+      resume('h', nh.k, f[0] > 0 ? 1 : -1);
     } else {
       this.mode = 'idle'; // stranded off-road; sits there
     }
+  }
+
+  // Which lane index is closest to where we're actually sitting?
+  nearestLane(world, axis, k, dir) {
+    const ax = axis === 'v' ? world.vA : world.hA;
+    const perp = axis === 'v' ? -dir : dir;
+    const posAlong = axis === 'v' ? this.y : this.x;
+    const posLat = axis === 'v' ? this.x : this.y;
+    const c = ax.centerAt(k, posAlong);
+    let best = 0, bd = Infinity;
+    for (let li = 0; li < ax.lanes(k); li++) {
+      const d = Math.abs(c + perp * laneOff(ax, k, li, this.bike) - posLat);
+      if (d < bd) { bd = d; best = li; }
+    }
+    return best;
   }
 
   applyHit(ix, iy, jx, jy, imp, env) {
@@ -876,6 +1147,17 @@ export class Traffic {
     const player = env.player;
     const inf = env.stats && env.stats.infractions;
     if (this.world.flat || !inf || player.dead) return;
+    // a patrol cop that sees an infraction go down lights up on the spot
+    if (env.t - (env.stats.lastInfractionT || -10) < 0.35) {
+      for (const c of this.cars) {
+        if (!c.police || c.pursuit || c.exploded || c.mode === 'wreck' || c.parkedOrigin) continue;
+        if (Math.hypot(c.x - player.x, c.y - player.y) > 230) continue;
+        const [cvx, cvy] = c.velocity();      // capture before the mode flips
+        c.vx = cvx; c.vy = cvy;
+        c.pursuit = true; c.mode = 'pursue'; c.chaseT = 0;
+        c.cruise = Math.max(c.cruise, 105 + Math.random() * 20);
+      }
+    }
     const total = Object.values(inf).reduce((a, b) => a + b, 0);
     const want = Math.floor(total / 10) - this.copsDestroyed;
     if (want <= 0) return;
@@ -1044,10 +1326,12 @@ export class Traffic {
         A.x -= nx * sep * mB * invSum; A.y -= ny * sep * mB * invSum;
         B.x += nx * sep * mA * invSum; B.y += ny * sep * mA * invSum;
 
-        // Cyclists are as fragile as pedestrians: the player plows straight
-        // through, flinging the rider and totalling the bike, taking no damage
-        // and barely slowing.
-        if ((isPA && B.bike) || (isPB && A.bike)) {
+        // Two-wheelers (cyclists AND motorcyclists) are as fragile as
+        // pedestrians: the player plows straight through, flinging the rider
+        // and totalling the bike, taking no damage and barely slowing.
+        const twoWheelsB = B.bike || B.type === 'motorcycle';
+        const twoWheelsA = A.bike || A.type === 'motorcycle';
+        if ((isPA && twoWheelsB) || (isPB && twoWheelsA)) {
           if (imp > 6) {
             const bike = isPA ? B : A;
             const dirx = isPA ? nx : -nx, diry = isPA ? ny : -ny;

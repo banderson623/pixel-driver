@@ -3,8 +3,9 @@
 // offset (SIDE_OFF) — that offset lands squarely on the painted crosswalk
 // bands, so walking straight through an intersection naturally follows the
 // stripes, and "crossing to the other side" hops across on the same bands.
-// The player can mow them down: a hit sprays blood, stains the ground, and
-// (in Rap Sheet mode) counts as an infraction.
+// Any fast-moving vehicle can mow them down — a hit sprays blood and stains
+// the ground; only the player's hits count as infractions (Rap Sheet mode).
+// Traffic sees them through env.peds and swerves/brakes to spare them.
 
 import { SIDEWALK, lakeShore } from './world.js';
 
@@ -347,6 +348,32 @@ export class Pedestrians {
           p.x += (dx / d) * (rr - d); p.y += (dy / d) * (rr - d);
         }
         break;
+      }
+    }
+
+    // AI traffic kills too: any vehicle moving at speed mows down pedestrians
+    // in its path the same way (no infraction — the player didn't do it).
+    // Traffic swerves and brakes for them, so this is mostly runaway wrecks
+    // and cops in hot pursuit.
+    for (const c of env.obstacles || []) {
+      if (c === player || !c.velocity) continue;
+      const v = c.velocity();
+      const cs = Math.hypot(v[0], v[1]);
+      if (cs <= 25) continue;
+      const f = [Math.sin(c.heading), -Math.cos(c.heading)];
+      const nose = Math.max(0, (c.half || 8) - (c.rad || 4));
+      const rr2 = (HIT_R - 2 + (c.rad || 5)) ** 2;
+      for (const p of this.peds) {
+        if (p.dead) continue;
+        let hit = false;
+        for (const off of [nose, 0, -nose]) {
+          const dx = p.x - (c.x + f[0] * off), dy = p.y - (c.y + f[1] * off);
+          if (dx * dx + dy * dy < rr2) { hit = true; break; }
+        }
+        if (!hit) continue;
+        p.kill(v[0] * 1.2 + (Math.random() - 0.5) * 30,
+               v[1] * 1.2 + (Math.random() - 0.5) * 30, env);
+        if (Math.hypot(p.x - player.x, p.y - player.y) < 280) env.sound.thud();
       }
     }
   }

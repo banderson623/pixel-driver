@@ -200,7 +200,7 @@ export class Game {
     const env = {
       world: this.world, particles: this.particles, sound: this.sound,
       camera: this.camera, stats: this.stats, player: this.player,
-      t: this.stats.t, obstacles: [],
+      t: this.stats.t, obstacles: [], peds: this.pedestrians.peds,
     };
     this.stats.t += dt;
     env.t = this.stats.t;
@@ -336,7 +336,7 @@ export class Game {
       const env = {
         world: this.world, particles: this.particles, sound: this.sound,
         camera: this.camera, stats: this.stats, player: this.player,
-        t: this.stats.t, obstacles: [],
+        t: this.stats.t, obstacles: [], peds: this.pedestrians.peds,
       };
       this.stats.t += dt;
       env.t = this.stats.t;
